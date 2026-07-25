@@ -31,22 +31,25 @@ Ruby 2.2 compatibility is additionally enforced on every release by `scripts/che
 
 Two claims previously stated here, based on reading the source rather than running it, turned out to be wrong. Recorded because they shaped the code.
 
-### `Sketchup.is_pro?` returns **true** on Make 2017
+### `Sketchup.is_pro?` returns **true** on Make 2017 — probably a trial
 
-This was assumed `false` on Make — the obvious reading of the name, and what the Pro/Make exporter split implies. On the test machine it returns `true`.
+This was assumed `false` on Make: the obvious reading of the name, and what the Pro/Make exporter split implies. On the test machine it returns `true`.
 
-A gate of the form `raise unless Sketchup.is_pro?` therefore does **not** reliably detect Make, and any such gate should be treated as unsound. One was added to `export_scene` for OBJ and has since been removed.
+**The likely explanation is the 30-day Pro trial.** SketchUp Make 2017 includes a Pro trial on a fresh install, so a newly-installed copy is effectively Pro for its first month. The test machine was installed on 2026-07-25, putting trial expiry around 2026-08-24.
 
-### OBJ export **works** on Make 2017
+Either way, a gate of the form `raise unless Sketchup.is_pro?` does **not** reliably distinguish Make from Pro — it reports the *current entitlement*, not the edition. One was added to `export_scene` for OBJ and has since been removed.
 
-The widely-repeated claim is that OBJ is a Pro-only exporter absent from Make. On the test machine, `export` with `format: "obj"` completed and wrote a file:
+### OBJ export works on Make 2017 — but see the trial caveat
 
-```
-MCP: Exporting to OBJ file: C:\Users\aidan\AppData\Local\Temp/sketchup_exports/sketchup_export_...obj
-MCP: Export completed successfully to: ...
-```
+The widely-repeated claim is that OBJ is a Pro-only exporter absent from Make. On the test machine, `export` with `format: "obj"` completed and wrote a real 1720-byte file plus a `.mtl` sidecar. COLLADA (11053 bytes) and PNG (13643 bytes) likewise.
 
-Whether that's because this install reports itself as Pro, or because Make 2017 genuinely ships the OBJ exporter, isn't yet distinguished. Either way, refusing OBJ up front was wrong, and that check has been removed. If an exporter genuinely is missing, the export call itself reports it.
+**This was almost certainly observed under an active Pro trial**, and the two facts are consistent: `is_pro?` was `true` at the time. So it does not establish that Make ships the OBJ exporter — only that this install had it while entitled to Pro.
+
+What happens once the trial lapses is **untested**. The conventional claim may well be correct for post-trial Make, in which case OBJ export will start failing.
+
+That doesn't change the fix. The guard that was removed (`if Sketchup.require("sketchup.rb")`) was broken regardless — it blocked exports that demonstrably worked. And `perform_export` degrades honestly: if the exporter disappears when the trial ends, `model.export` returns falsy or raises, and the caller gets "OBJ exporter is not available in this SketchUp edition" rather than silence.
+
+Re-testing exports after 2026-08-24 would settle it.
 
 ## Open questions
 
