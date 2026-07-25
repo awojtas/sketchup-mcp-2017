@@ -44,9 +44,26 @@ The system consists of two main components:
 
 ## Installation
 
-### Python Packaging
+### Prerequisite: uv
 
-We're using uv so you'll need to ```brew install uv```
+The MCP server is launched with [uv](https://docs.astral.sh/uv/). Install it first — if it's missing, Claude reports the MCP server as `failed` with error `-32000`, which looks like a server bug rather than a missing command.
+
+```powershell
+winget install --id=astral-sh.uv -e          # Windows
+```
+```bash
+brew install uv                               # macOS
+curl -LsSf https://astral.sh/uv/install.sh | sh   # Linux
+```
+
+Open a new terminal afterwards so `uv` is on `PATH`, and check with `uv --version`.
+
+Prefer not to use uv? A plain pip install works too, as long as it's from git rather than PyPI — see the warning below:
+
+```bash
+pip install git+https://github.com/awojtas/sketchup-mcp-2017
+claude mcp add sketchup -- sketchup-mcp
+```
 
 ### Sketchup Extension
 
