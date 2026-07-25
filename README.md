@@ -10,6 +10,10 @@
 >
 > All credit for the original work goes to [@mhyrr](https://github.com/mhyrr). Non-2017-specific fixes are offered back upstream where possible.
 
+SketchupMCP connects Sketchup to Claude AI through the Model Context Protocol (MCP), allowing Claude to directly interact with and control Sketchup. This integration enables prompt-assisted 3D modeling, scene creation, and manipulation in Sketchup.
+
+Big Shoutout to [Blender MCP](https://github.com/ahujasid/blender-mcp) for the inspiration and structure.
+
 ### The UI-freeze bug
 
 SketchUp runs Ruby on its **main UI thread**. Upstream's socket loop accepted a connection and then called `client.gets`, which blocks until a newline arrives.
@@ -21,10 +25,6 @@ This fork replaces that with a fully non-blocking loop: each timer tick drains w
 Threads aren't an option here — the SketchUp Ruby API isn't thread-safe, and Ruby threads don't get scheduled while the main thread is blocked anyway.
 
 Two other people hit this independently and proposed fixes upstream ([#7](https://github.com/mhyrr/sketchup-mcp/pull/7) by @Noel-Alex, [#22](https://github.com/mhyrr/sketchup-mcp/pull/22) by @gleydson115-code); both are unmerged. Both cap the blocking read at a short timeout rather than removing it, which leaves the UI thread stalling briefly on every tick and discards partially-received requests when the budget expires. `tests/test_socket_loop.rb` covers that fragmentation case, along with the freeze itself.
-
-SketchupMCP connects Sketchup to Claude AI through the Model Context Protocol (MCP), allowing Claude to directly interact with and control Sketchup. This integration enables prompt-assisted 3D modeling, scene creation, and manipulation in Sketchup.
-
-Big Shoutout to [Blender MCP](https://github.com/ahujasid/blender-mcp) for the inspiration and structure.
 
 ## SketchUp Make 2017 compatibility
 
@@ -49,18 +49,61 @@ Status: **verified against a real SketchUp Make 2017 install** (`17.2.2555`), wi
 * **Selection handling**: Get and manipulate selected components
 * **Ruby code evaluation**: Execute arbitrary Ruby code directly in SketchUp for advanced operations
 
-## Components
+## How it fits together
 
-The system consists of two main components:
+There are two separate pieces, and they have a **server / client** relationship. Getting this straight makes the setup and the troubleshooting much easier.
 
-1. **Sketchup Extension**: A Sketchup extension that creates a TCP server within Sketchup to receive and execute commands
-2. **MCP Server (`sketchup_mcp/server.py`)**: A Python server that implements the Model Context Protocol and connects to the Sketchup extension
+```
+   Claude Code                sketchup-mcp                 SketchUp
+   Claude Desktop             (Python package)             + su_mcp extension
+  ┌──────────────┐   MCP     ┌──────────────────┐   TCP   ┌──────────────────┐
+  │              │  stdio    │                  │  :9876  │                  │
+  │   the agent  ├──────────▶│   THE CLIENT     ├────────▶│   THE SERVER     │
+  │              │           │                  │         │   (listening)    │
+  └──────────────┘           └──────────────────┘         └──────────────────┘
+                              started automatically        started BY YOU from
+                              by the agent                 the SketchUp menu
+```
+
+### The server — the SketchUp extension
+
+The `.rbz` you install into SketchUp. It opens a TCP socket on `127.0.0.1:9876` and waits for commands, which it executes against the open model.
+
+**You start it manually, every SketchUp session**: `Extensions > MCP Server > Start Server`. Nothing starts it for you, and it does not run just because the extension is installed. If you skip this step, everything else will look correctly configured and still not work.
+
+### The client — the `sketchup-mcp` Python package
+
+Confusingly, this is the thing usually called "the MCP server", because it *is* an MCP server — to Claude. But in its relationship with SketchUp it is the **client**: it opens the connection to port 9876 and sends commands.
+
+So it wears two hats:
+
+| Direction | Role |
+|---|---|
+| Towards Claude | MCP **server** — exposes the tools Claude can call |
+| Towards SketchUp | TCP **client** — connects to the extension and sends it work |
+
+**Your coding agent starts this automatically** once it's registered (see below) — you don't launch it by hand for normal use. You *can* run it manually, which is useful for testing, because you get its log directly in the terminal:
+
+```bash
+uvx --from git+https://github.com/awojtas/sketchup-mcp-2017 sketchup-mcp
+```
+
+Run that way it prints its startup log and then waits on stdin. `Connected to SketchUp at localhost:9876` means the extension is running and reachable; `Could not connect` means you haven't started the server in SketchUp. Ctrl+C when done — the agent needs to launch its own copy.
+
+### Which one is broken?
+
+| Symptom | Which half |
+|---|---|
+| Claude reports the MCP server as `failed` | Client — it isn't starting. Check `uv` is installed. |
+| Claude connects, but tool calls fail | Server — the extension isn't started, or SketchUp isn't running |
+| Nothing in the Ruby Console on Start Server | Server — see Troubleshooting |
+| Works, then stops working after reopening SketchUp | Server — restarting SketchUp does not restart it; use the menu again |
 
 ## Installation
 
 ### Prerequisite: uv
 
-The MCP server is launched with [uv](https://docs.astral.sh/uv/). Install it first — if it's missing, Claude reports the MCP server as `failed` with error `-32000`, which looks like a server bug rather than a missing command.
+The client is launched with [uv](https://docs.astral.sh/uv/). Install it first — if it's missing, Claude reports the MCP server as `failed` with error `-32000`, which looks like a bug in this project rather than a missing command.
 
 ```powershell
 winget install --id=astral-sh.uv -e          # Windows
@@ -79,7 +122,7 @@ pip install git+https://github.com/awojtas/sketchup-mcp-2017
 claude mcp add sketchup -- sketchup-mcp
 ```
 
-### Sketchup Extension
+### Install the server (the SketchUp extension)
 
 1. Download the latest `.rbz` from [Releases](https://github.com/awojtas/sketchup-mcp-2017/releases) (or build it yourself with `cd su_mcp && ruby package.rb`)
 2. In Sketchup, go to Window > Extension Manager
@@ -92,14 +135,16 @@ On SketchUp 2017 the Extension Manager may refuse to load an unsigned extension.
 
 ### Both halves must run on the same machine
 
-The extension listens on `127.0.0.1:9876` and the MCP server dials `localhost:9876`. That's loopback on both ends, so **Claude and SketchUp have to be on the same computer**. Running Claude on a different machine to the one running SketchUp will not connect without an SSH tunnel forwarding port 9876.
+The server binds `127.0.0.1:9876` and the client dials `localhost:9876`. That's loopback on both ends, so **Claude and SketchUp have to be on the same computer**. Running Claude on a different machine from SketchUp will not connect without an SSH tunnel forwarding port 9876.
 
 This is deliberate: the extension exposes an `eval_ruby` command that executes arbitrary Ruby inside SketchUp. Binding it to anything other than loopback would expose remote code execution to your network.
 
-### Starting the Connection
+### Step 1 — start the server (in SketchUp, every session)
 
 1. In SketchUp, go to **Extensions > MCP Server > Start Server**.
-2. The Ruby Console appears and logs `Starting server on localhost:9876...` followed by `Server started`. That console line is the confirmation — the menu gives no other feedback.
+2. The Ruby Console appears and logs `Starting server ... on localhost:9876` followed by `Server listening on port 9876`. That console line is the confirmation — the menu gives no other feedback.
+
+This has to be done again each time you restart SketchUp.
 
 To double-check the listener is actually up:
 
@@ -110,15 +155,19 @@ netstat -ano | findstr 9876
 lsof -nP -iTCP:9876 -sTCP:LISTEN
 ```
 
-### Using with Claude Code
+### Step 2 — register the client with your agent (once)
+
+#### Claude Code
 
 ```bash
 claude mcp add sketchup -- uvx --from git+https://github.com/awojtas/sketchup-mcp-2017 sketchup-mcp
 ```
 
-Then `/mcp` inside Claude Code to confirm it connected.
+Then `/mcp` inside Claude Code to confirm. This is a one-off — from then on Claude Code launches the client itself whenever it needs it.
 
-### Using with Claude Desktop
+Note that the client will report as **connected even with SketchUp closed**: it only warns at startup and fails at tool-call time. A connected client is not proof the server is running.
+
+#### Claude Desktop
 
 ```json
 {
@@ -163,9 +212,34 @@ Here are some examples of what you can ask Claude to do:
 
 ## Troubleshooting
 
-* **Connection issues**: Make sure both the Sketchup extension server and the MCP server are running
-* **Command failures**: Check the Ruby Console in Sketchup for error messages
-* **Timeout errors**: Try simplifying your requests or breaking them into smaller steps
+Work out **which half** is at fault first — see [Which one is broken?](#which-one-is-broken) above.
+
+**Claude shows the MCP server as `failed`, error `-32000`.** The client isn't starting, and this error says nothing useful about why. Run it by hand to see the real message:
+
+```bash
+uvx --from git+https://github.com/awojtas/sketchup-mcp-2017 sketchup-mcp
+```
+
+Most often `uv` isn't installed, or isn't on `PATH` yet in the terminal Claude inherited. Restart Claude after installing it.
+
+**Claude is connected, but every tool call fails.** The client connects happily whether or not SketchUp is listening — it only warns at startup. So a connected client tells you nothing about the server. Check SketchUp is open and you've run **Extensions > MCP Server > Start Server** this session.
+
+**Nothing appears in the Ruby Console when you click Start Server.** On v2.0.0 exactly this happened: lifecycle messages were logged below the console's threshold. Fixed in v2.0.1. If you're on 2.0.0, upgrade. To confirm the listener independently of the console:
+
+```bash
+netstat -ano | findstr 9876          # Windows
+lsof -nP -iTCP:9876 -sTCP:LISTEN     # macOS / Linux
+```
+
+**It worked, then stopped after restarting SketchUp.** The server does not auto-start. Run the menu item again.
+
+**Extension Manager shows the old version after installing a new `.rbz`.** It caches the loaded list. Restart SketchUp and check again — the new version is usually installed correctly despite what the dialog says.
+
+**SketchUp freezes when Claude connects.** That's the upstream bug, fixed in v1.7.0. You're running an old build or upstream's.
+
+**Command failures.** The Ruby Console carries the server-side error. For more detail, set `SKETCHUP_MCP_LOG_LEVEL=DEBUG` and `SKETCHUP_MCP_VERBOSE_CONSOLE=1`.
+
+**Timeout errors.** `eval_ruby` is capped (default 30s, `SKETCHUP_MCP_EVAL_TIMEOUT`). Long-running geometry work may need a larger value or breaking into smaller calls.
 
 ## Technical Details
 
