@@ -228,7 +228,9 @@ git tag v1.6.0
 git push origin v1.6.0
 ```
 
-CI checks Ruby 2.2 compatibility, builds the `.rbz`, and publishes a GitHub Release with the file attached. The tag is the only place the version is written — it's stamped into `extension.json` and the loader at build time, so the three version strings can't drift apart again. Builds are byte-for-byte reproducible.
+CI checks Ruby 2.2 compatibility, runs the socket regression suite, builds the `.rbz`, and publishes a GitHub Release with the file attached. The tag is the only place a version is written — it's stamped into `extension.json`, the loader, and `main.rb`'s `VERSION` at build time, and the build fails if any of the three disagree.
+
+The *contents* of a build are deterministic: same source and version in, same files out, with fixed timestamps. The archive's compressed bytes are not — zlib's output varies between Python versions, so a `.rbz` built locally can differ in size from the one CI publishes while containing byte-identical files. Compare file contents, not the archive hash.
 
 ## Contributing
 

@@ -41,6 +41,6 @@ It had never been run against SketchUp 2017 and carried three defects:
 
 ## Release tooling
 
-- `scripts/build_rbz.py` — builds the `.rbz` using only the Python standard library. Upstream's `package.rb` needs the `rubyzip` gem, which is why [issue #10](https://github.com/mhyrr/sketchup-mcp/issues/10) ("cannot find the .rbz files") went unanswered. Asserts the archive layout SketchUp requires and produces byte-identical output across runs.
+- `scripts/build_rbz.py` — builds the `.rbz` using only the Python standard library. Upstream's `package.rb` needs the `rubyzip` gem, which is why [issue #10](https://github.com/mhyrr/sketchup-mcp/issues/10) ("cannot find the .rbz files") went unanswered. Asserts the archive layout SketchUp requires, and that every version string matches the tag. File contents are deterministic for a given source and version; the compressed archive bytes are not, since zlib output differs between Python versions.
 - `scripts/check_ruby22_compat.py` — fails the build on syntax newer than Ruby 2.2.4. Heuristic rather than a real parse, since no Ruby 2.2 build exists for modern CI images. It caught both of PR #17's incompatibilities.
 - `tests/test_socket_loop.rb` — drives the real socket loop against a real socket with the SketchUp runtime stubbed. Covers the freeze, persistent connections, TCP fragmentation, malformed input, dead-socket handling, reconnect, and console output.
