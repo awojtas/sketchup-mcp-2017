@@ -2,6 +2,7 @@ require 'sketchup'
 require 'json'
 require 'socket'
 require 'fileutils'
+require 'tmpdir'
 
 puts "MCP Extension loading..."
 SKETCHUP_CONSOLE.show rescue nil
@@ -589,6 +590,30 @@ module SU_MCP
       { success: true, entities: selected_entities }
     end
     
+    # SketchUp Make and Pro ship different exporter sets. Sketchup.is_pro? has
+    # been available since long before 2017, but guard the call anyway so an
+    # unexpected edition can't take the whole command down.
+    def pro?
+      Sketchup.respond_to?(:is_pro?) ? Sketchup.is_pro? : false
+    end
+
+    # model.export returns false, or raises, when no exporter is registered for
+    # the target extension. The original code guarded these calls with
+    # Sketchup.require("sketchup.rb") -- always truthy, so it tested nothing and
+    # turned a missing exporter into an opaque failure.
+    def perform_export(model, path, options, label)
+      result = begin
+        model.export(path, options)
+      rescue ArgumentError, NotImplementedError, RuntimeError => e
+        raise "#{label} exporter is not available in this SketchUp edition (#{e.message})"
+      end
+
+      raise "#{label} exporter is not available in this SketchUp edition" unless result
+      raise "#{label} export reported success but wrote no file to #{path}" unless File.exist?(path)
+
+      result
+    end
+
     def export_scene(params)
       log "Exporting scene with params: #{params.inspect}"
       model = Sketchup.active_model
@@ -612,49 +637,42 @@ module SU_MCP
           model.save(export_path)
           
         when "obj"
-          # Export as OBJ file
+          # OBJ is a Pro-only exporter. On Make -- including Make 2017 -- it is
+          # absent, so say so plainly instead of letting model.export fail
+          # somewhere the caller can't interpret.
+          unless pro?
+            raise "OBJ export requires SketchUp Pro. This is SketchUp Make, which " \
+                  "ships the COLLADA and image exporters only. Use format 'dae' instead."
+          end
+
           export_path = File.join(temp_dir, "#{filename}.obj")
           log "Exporting to OBJ file: #{export_path}"
-          
-          # Check if OBJ exporter is available
-          if Sketchup.require("sketchup.rb")
-            options = {
-              :triangulated_faces => true,
-              :double_sided_faces => true,
-              :edges => false,
-              :texture_maps => true
-            }
-            model.export(export_path, options)
-          else
-            raise "OBJ exporter not available"
-          end
-          
+
+          options = {
+            :triangulated_faces => true,
+            :double_sided_faces => true,
+            :edges => false,
+            :texture_maps => true
+          }
+          perform_export(model, export_path, options, "OBJ")
+
         when "dae"
-          # Export as COLLADA file
+          # COLLADA ships with Make as well as Pro.
           export_path = File.join(temp_dir, "#{filename}.dae")
           log "Exporting to COLLADA file: #{export_path}"
-          
-          # Check if COLLADA exporter is available
-          if Sketchup.require("sketchup.rb")
-            options = { :triangulated_faces => true }
-            model.export(export_path, options)
-          else
-            raise "COLLADA exporter not available"
-          end
-          
+
+          perform_export(model, export_path, { :triangulated_faces => true }, "COLLADA")
+
         when "stl"
-          # Export as STL file
+          # STL is not built in on every version -- on 2017 it comes from the
+          # separately installed SketchUp STL extension. Attempt it and let
+          # perform_export report clearly if no exporter is registered.
           export_path = File.join(temp_dir, "#{filename}.stl")
           log "Exporting to STL file: #{export_path}"
-          
-          # Check if STL exporter is available
-          if Sketchup.require("sketchup.rb")
-            options = { :units => "model" }
-            model.export(export_path, options)
-          else
-            raise "STL exporter not available"
-          end
-          
+
+          perform_export(model, export_path, { :units => "model" }, "STL")
+
+
         when "png", "jpg", "jpeg"
           # Export as image
           ext = format.downcase == "jpg" ? "jpeg" : format.downcase

@@ -1,0 +1,99 @@
+name: Release
+
+# Push a tag like v1.6.0 to cut a release. The tag is the single source of
+# truth for the version -- it gets stamped into extension.json and the loader
+# at build time, so there's no version bump to remember in three places.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build, e.g. 1.6.0 (produces an artifact, not a release)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="${INPUT_VERSION#v}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building version $version"
+
+      # The whole point of this fork: never ship an .rbz that can't load on
+      # SketchUp 2017's Ruby 2.2.4.
+      - name: Check Ruby 2.2 compatibility
+        run: python3 scripts/check_ruby22_compat.py
+
+      - name: Build .rbz
+        run: python3 scripts/build_rbz.py --version "${{ steps.version.outputs.version }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: su_mcp_v${{ steps.version.outputs.version }}.rbz
+          path: dist/*.rbz
+          if-no-files-found: error
+
+      - name: Write release notes
+        if: github.ref_type == 'tag'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          cat > release-notes.md <<NOTES
+          ## Install
+
+          1. Download \`su_mcp_v${VERSION}.rbz\` below.
+          2. In SketchUp: **Window > Extension Manager > Install Extension**, and select the file.
+          3. Restart SketchUp. The server is under **Extensions > SketchupMCP > Start Server**.
+
+          This extension is unsigned. If SketchUp refuses to load it, open
+          Extension Manager > Settings and set the loading policy to **Unrestricted**.
+
+          ## SketchUp Make 2017
+
+          Built and checked for Make 2017 compatibility (Ruby 2.2.4). One caveat:
+          \`export_scene\` with format \`obj\` needs SketchUp Pro, since the OBJ
+          exporter does not ship with Make. Use \`dae\` there instead.
+
+          Full notes: [docs/sketchup-make-2017.md](https://github.com/${REPO}/blob/main/docs/sketchup-make-2017.md)
+
+          ## Credit
+
+          Fork of [mhyrr/sketchup-mcp](https://github.com/mhyrr/sketchup-mcp).
+          NOTES
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "v$VERSION" \
+            --notes-file release-notes.md \
+            "dist/su_mcp_v${VERSION}.rbz"

@@ -111,6 +111,19 @@ The extension opens a TCP listener inside SketchUp and exposes an `eval_ruby` co
 uv sync                      # install dependencies
 uv run sketchup-mcp          # run the MCP server
 
-# Build the extension package
-cd su_mcp && ruby package.rb # produces su_mcp_v<VERSION>.rbz
+# Build the extension package (stdlib only — no Ruby, no rubyzip)
+python3 scripts/build_rbz.py --version 1.6.0
+
+# Verify the extension still runs on SketchUp 2017's Ruby 2.2.4
+python3 scripts/check_ruby22_compat.py
 ```
+
+Upstream's `su_mcp/package.rb` is left in place but is not the canonical builder — it needs the `rubyzip` gem, which is precisely what blocked people from producing an `.rbz` at all.
+
+## Releasing
+
+Releases are tag-driven. Push `v<MAJOR>.<MINOR>.<PATCH>` and `.github/workflows/release.yml` runs the 2.2 compatibility check, builds the `.rbz`, and publishes a GitHub Release with the artifact attached.
+
+The tag is the **only** place a version is written. `build_rbz.py` stamps it into `extension.json` and the loader at build time. Don't reintroduce hardcoded version bumps — three copies had already drifted to 1.6.0 / 1.5.0 / 0.1.17 before this was centralised.
+
+The archive layout is load-bearing. SketchUp needs `su_mcp.rb`, `su_mcp/main.rb`, and `extension.json` at the **archive root**; nesting them one level deeper produces an extension that installs silently and then does nothing. `build_rbz.py` asserts this after writing.

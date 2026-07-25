@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # GitHub Actions — keeps the release workflow's actions current
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+
+  # The Python MCP server half. The extension half deliberately has no
+  # dependencies — it ships as an .rbz and can only use SketchUp's bundled
+  # Ruby stdlib, so there is nothing for Dependabot to track there.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
