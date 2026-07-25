@@ -500,7 +500,10 @@ module SU_MCP
               success: true,
               resourceId: result[:id],
               structured: result[:result].is_a?(Hash) ? result[:result] : nil
-            }.compact,
+              # Hash#compact is Ruby 2.4+; SketchUp 2017 has 2.2.4. reject is
+              # equivalent and works everywhere. This line ran on every
+              # successful tool call, so getting it wrong broke all of them.
+            }.reject { |_k, v| v.nil? },
             id: request["id"]
           }
           debug "Sending success response (#{payload_text.bytesize} bytes)"
@@ -832,6 +835,27 @@ module SU_MCP
       { success: true, entities: selected_entities }
     end
     
+    # model.export returns false, or raises, when no exporter is registered for
+    # the target extension. Report that plainly.
+    #
+    # This replaces guards of the form `if Sketchup.require("sketchup.rb")`.
+    # Sketchup.require returns false when the file is *already loaded*, and
+    # sketchup.rb always is, so those guards took the else branch every time
+    # and raised "<FORMAT> exporter not available" without ever attempting an
+    # export -- on installs where the export in fact works fine.
+    def perform_export(model, path, options, label)
+      result = begin
+        model.export(path, options)
+      rescue ArgumentError, NotImplementedError, RuntimeError => e
+        raise "#{label} exporter is not available in this SketchUp edition (#{e.message})"
+      end
+
+      raise "#{label} exporter is not available in this SketchUp edition" unless result
+      raise "#{label} export reported success but wrote no file to #{path}" unless File.exist?(path)
+
+      result
+    end
+
     def export_scene(params)
       log "Exporting scene with params: #{params.inspect}"
       model = Sketchup.active_model
@@ -859,44 +883,29 @@ module SU_MCP
           export_path = File.join(temp_dir, "#{filename}.obj")
           log "Exporting to OBJ file: #{export_path}"
           
-          # Check if OBJ exporter is available
-          if Sketchup.require("sketchup.rb")
-            options = {
-              :triangulated_faces => true,
-              :double_sided_faces => true,
-              :edges => false,
-              :texture_maps => true
-            }
-            model.export(export_path, options)
-          else
-            raise "OBJ exporter not available"
-          end
+          options = {
+            :triangulated_faces => true,
+            :double_sided_faces => true,
+            :edges => false,
+            :texture_maps => true
+          }
+          perform_export(model, export_path, options, "OBJ")
           
         when "dae"
           # Export as COLLADA file
           export_path = File.join(temp_dir, "#{filename}.dae")
           log "Exporting to COLLADA file: #{export_path}"
           
-          # Check if COLLADA exporter is available
-          if Sketchup.require("sketchup.rb")
-            options = { :triangulated_faces => true }
-            model.export(export_path, options)
-          else
-            raise "COLLADA exporter not available"
-          end
+          options = { :triangulated_faces => true }
+          perform_export(model, export_path, options, "COLLADA")
           
         when "stl"
           # Export as STL file
           export_path = File.join(temp_dir, "#{filename}.stl")
           log "Exporting to STL file: #{export_path}"
           
-          # Check if STL exporter is available
-          if Sketchup.require("sketchup.rb")
-            options = { :units => "model" }
-            model.export(export_path, options)
-          else
-            raise "STL exporter not available"
-          end
+          options = { :units => "model" }
+          perform_export(model, export_path, options, "STL")
           
         when "png", "jpg", "jpeg"
           # Export as image

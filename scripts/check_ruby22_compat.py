@@ -38,6 +38,19 @@ CHECKS = [
     # 2.2 String.new takes only a positional string, so the Hash is coerced
     # and raises TypeError. Use "".force_encoding(...) instead.
     ("String.new with keyword args", re.compile(r"String\.new\s*\(\s*\w+:"), "2.3"),
+    # Hash#compact is 2.4+, but Array#compact has always existed, so a bare
+    # `.compact` can't be judged from a single line. Flag only the cases where
+    # the receiver is visibly a Hash: a literal `}` immediately before, or a
+    # `to_h`/`Hash[...]` result. Use `.reject { |_k, v| v.nil? }` instead.
+    ("Hash#compact", re.compile(r"(\}|\.to_h|\bHash\[[^\]]*\])\s*\.compact\b"), "2.4"),
+]
+
+# Some checks span lines -- e.g. a multi-line hash literal whose closing brace
+# and .compact sit on the same line, versus one where .compact trails on the
+# next. Patterns listed here are additionally run against the whole file.
+MULTILINE_CHECKS = [
+    ("Hash#compact (multi-line literal)",
+     re.compile(r"\}\s*\n\s*\.compact\b"), "2.4"),
 ]
 
 # Ruby lets you write string literals a dozen ways. Cover the ones that
@@ -51,6 +64,10 @@ STRING_PATTERNS = [
 ]
 COMMENT_PATTERN = re.compile(r"#.*$")
 
+# A `{` introducing a block rather than a hash literal. Used to keep
+# Array#compact (fine on 2.2) from being reported as Hash#compact.
+BLOCK_RE = re.compile(r"\{\s*\|")
+
 
 def strip_noise(line: str) -> str:
     """Neutralise strings and comments so their contents can't trigger a match.
@@ -63,6 +80,19 @@ def strip_noise(line: str) -> str:
     for pattern in STRING_PATTERNS:
         line = pattern.sub(lambda m: "S" * len(m.group()), line)
     return COMMENT_PATTERN.sub(lambda m: " " * len(m.group()), line)
+
+
+def scan_multiline(path: Path):
+    """Checks that need to see across line boundaries."""
+    findings = []
+    text = path.read_text(encoding="utf-8")
+
+    for label, pattern, version in MULTILINE_CHECKS:
+        for match in pattern.finditer(text):
+            lineno = text.count("\n", 0, match.start()) + 1
+            findings.append((lineno, label, version, match.group().strip()))
+
+    return findings
 
 
 def scan(path: Path):
@@ -93,8 +123,16 @@ def scan(path: Path):
         line = strip_noise(raw)
 
         for label, pattern, version in CHECKS:
-            if pattern.search(line):
-                findings.append((lineno, label, version, raw.strip()))
+            if not pattern.search(line):
+                continue
+
+            # `}` closes a block as well as a hash literal, so
+            # `ids.map { |i| ... }.compact` is Array#compact and perfectly
+            # fine on 2.2. Only a hash literal is a problem.
+            if label == "Hash#compact" and BLOCK_RE.search(line):
+                continue
+
+            findings.append((lineno, label, version, raw.strip()))
 
     return findings
 
@@ -114,7 +152,7 @@ def main() -> int:
             continue
 
         checked += 1
-        for lineno, label, version, source in scan(path):
+        for lineno, label, version, source in sorted(scan(path) + scan_multiline(path)):
             total += 1
             print(f"{target}:{lineno}: {label} -- needs Ruby {version}, SketchUp 2017 has 2.2.4")
             print(f"    {source}")
