@@ -59,28 +59,52 @@ On SketchUp 2017 the Extension Manager may refuse to load an unsigned extension.
 
 ## Usage
 
+### Both halves must run on the same machine
+
+The extension listens on `127.0.0.1:9876` and the MCP server dials `localhost:9876`. That's loopback on both ends, so **Claude and SketchUp have to be on the same computer**. Running Claude on a different machine to the one running SketchUp will not connect without an SSH tunnel forwarding port 9876.
+
+This is deliberate: the extension exposes an `eval_ruby` command that executes arbitrary Ruby inside SketchUp. Binding it to anything other than loopback would expose remote code execution to your network.
+
 ### Starting the Connection
 
-1. In Sketchup, go to Extensions > MCP Server > Start Server
-2. The server will start on the default port (9876)
-3. Make sure the MCP server is running in your terminal
+1. In SketchUp, go to **Extensions > MCP Server > Start Server**.
+2. The Ruby Console appears and logs `Starting server on localhost:9876...` followed by `Server started`. That console line is the confirmation — the menu gives no other feedback.
 
-### Using with Claude
+To double-check the listener is actually up:
 
-Configure Claude to use the MCP server by adding the following to your Claude configuration:
-
-```json
-    "mcpServers": {
-        "sketchup": {
-            "command": "uvx",
-            "args": [
-                "sketchup-mcp"
-            ]
-        }
-    }
+```bash
+# Windows
+netstat -ano | findstr 9876
+# macOS / Linux
+lsof -nP -iTCP:9876 -sTCP:LISTEN
 ```
 
-This will pull the [latest from PyPI](https://pypi.org/project/sketchup-mcp/)
+### Using with Claude Code
+
+```bash
+claude mcp add sketchup -- uvx --from git+https://github.com/awojtas/sketchup-mcp-2017 sketchup-mcp
+```
+
+Then `/mcp` inside Claude Code to confirm it connected.
+
+### Using with Claude Desktop
+
+```json
+{
+  "mcpServers": {
+    "sketchup": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/awojtas/sketchup-mcp-2017", "sketchup-mcp"]
+    }
+  }
+}
+```
+
+> **Don't use `uvx sketchup-mcp`.** Upstream's README recommends it, but the
+> [PyPI package](https://pypi.org/project/sketchup-mcp/) is stale: 0.1.17 was published
+> before upstream's own `instructions=`/`description=` FastMCP fix, so it raises a
+> `TypeError` on startup against current versions of the `mcp` package. Installing from
+> git, as above, avoids this. This fork does not publish to PyPI — upstream owns that name.
 
 Once connected, Claude can interact with Sketchup using the following capabilities:
 
