@@ -43,6 +43,7 @@ module SU_MCP
       @timer_id    = nil
       @clients     = []   # array of {sock:, buffer:, id: }
       @next_cid    = 1
+      @in_tick     = false
       @log_level   = parse_log_level(ENV['SKETCHUP_MCP_LOG_LEVEL'] || 'INFO')
       @log_to_file = ENV['SKETCHUP_MCP_LOG_FILE']  # path, optional
       @verbose_console = ENV['SKETCHUP_MCP_VERBOSE_CONSOLE'] == '1'
@@ -154,10 +155,31 @@ module SU_MCP
     end
 
     # Single tick of the UI timer: accept new connections, drain existing ones.
+    #
+    # Guarded against re-entry. SketchUp keeps firing UI timers while a previous
+    # callback is still inside a blocking native call, so a long-running
+    # model.export re-enters tick from underneath itself. Observed on Make 2017
+    # during an STL export, which blocks for minutes:
+    #
+    #   main.rb:in `tick'          <- fired again
+    #   main.rb:in `block in start'
+    #   main.rb:in `export'
+    #   main.rb:in `perform_export' <- still blocked in the first call
+    #
+    # @clients is then mutated from two stack frames at once, and a client can
+    # be serviced or dropped while an outer frame still holds it. Skipping the
+    # tick is correct: the timer fires again in 100ms.
     def tick
       return unless @running
-      accept_new_connections
-      service_clients
+      return if @in_tick
+
+      @in_tick = true
+      begin
+        accept_new_connections
+        service_clients
+      ensure
+        @in_tick = false
+      end
     rescue StandardError => e
       error "tick error: #{e.message}"
       error e.backtrace.first(5).join("\n")
@@ -425,10 +447,28 @@ module SU_MCP
       end
     end
 
+    # Compact, bounded argument preview for the one-line call log. eval_ruby
+    # payloads and geometry arrays get large, so this is a preview and not a
+    # record -- the full request is still logged at DEBUG.
+    def summarise_args(args)
+      return "" unless args.is_a?(Hash) && !args.empty?
+
+      text = args.map { |k, v| "#{k}=#{v.inspect}" }.join(" ")
+      text = text[0, 100] + "..." if text.length > 100
+      " (#{text})"
+    end
+
     def handle_tool_call(request)
       log "Handling tool call: #{request.inspect}"
       tool_name = request["params"]["name"]
       args = request["params"]["arguments"]
+
+      # One line per tool call at INFO, so the console shows what the agent is
+      # doing without turning on DEBUG. Logged on entry rather than completion
+      # on purpose: when a call hangs -- SketchUp's own STL exporter blocks the
+      # UI thread indefinitely -- the last line in the console names the call
+      # that did it.
+      info "tool: #{tool_name}#{summarise_args(args)}"
 
       begin
         result = case tool_name

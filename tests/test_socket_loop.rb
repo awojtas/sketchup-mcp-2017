@@ -138,6 +138,23 @@ check("new client served", line6 && JSON.parse(line6)["id"] == 9, line6.inspect)
 client2.close
 20.times { server.send(:tick); sleep 0.005 }
 
+# --- Re-entrancy -----------------------------------------------------------
+# SketchUp keeps firing UI timers while a previous callback is blocked inside
+# a native call, so a slow model.export re-enters tick from underneath itself
+# and two frames mutate @clients at once. Observed on Make 2017 during an STL
+# export. Simulate by re-entering tick from inside a handler.
+puts "\n7b. tick does not re-enter itself"
+reentered = false
+server.define_singleton_method(:accept_new_connections) do
+  # Stand in for a blocking model.export: the timer fires again mid-call.
+  reentered = true if @in_tick == false
+  server.send(:tick)
+end
+server.send(:tick)
+server.singleton_class.send(:remove_method, :accept_new_connections)
+check("nested tick was skipped rather than run", !reentered)
+check("guard released after the call", server.instance_variable_get(:@in_tick) == false)
+
 # --- The success path must actually serialise --------------------------------
 # Every check above drives error paths or metadata calls. Hash#compact (Ruby
 # 2.4+) sat on the *success* serialiser, so on SketchUp 2017 every tool call
