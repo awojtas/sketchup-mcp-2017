@@ -59,6 +59,11 @@ elapsed = Time.now - t0
 check("30 polls with a silent connected client returned promptly", elapsed < 0.5,
       format("took %.3fs", elapsed))
 
+# A client attaching is the moment the two halves meet, and the console is the
+# only place a user can see it. Logged at DEBUG it never reached them.
+check("client connection is reported to the console",
+      $log_lines.any? { |l| l =~ /client .*connected/i }, $log_lines.last(3).inspect)
+
 # --- Normal request/response ----------------------------------------------
 puts "\n2. Request gets a response"
 client.write({ jsonrpc: "2.0", id: 1, method: "prompts/list" }.to_json + "\n")

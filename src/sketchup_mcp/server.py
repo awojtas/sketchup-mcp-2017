@@ -810,7 +810,15 @@ def ping(ctx: Context) -> str:
 
 
 def main():
-    mcp.run()
+    try:
+        mcp.run()
+    except KeyboardInterrupt:
+        # Running this by hand to check connectivity is a documented workflow,
+        # and Ctrl+C is how you end it. Without this, the interrupt unwinds
+        # through anyio and asyncio and prints ~60 lines of traceback, which
+        # reads as a crash rather than a normal exit.
+        logger.info("Interrupted, shutting down")
+        return 0
 
 
 if __name__ == "__main__":

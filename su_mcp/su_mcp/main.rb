@@ -172,7 +172,9 @@ module SU_MCP
           cid = @next_cid
           @next_cid += 1
           @clients << { sock: sock, buffer: "".force_encoding(Encoding::BINARY), id: cid }
-          debug "Client ##{cid} connected"
+          # Lifecycle, not per-request chatter: this is how a user confirms the
+          # two halves have actually found each other.
+          info "Client ##{cid} connected"
         rescue IO::WaitReadable, Errno::EAGAIN
           break
         end
@@ -185,7 +187,7 @@ module SU_MCP
           drain_client(c)
           false  # keep
         rescue EOFError, Errno::ECONNRESET, Errno::EPIPE
-          debug "Client ##{c[:id]} disconnected"
+          info "Client ##{c[:id]} disconnected"
           begin c[:sock].close rescue nil end
           true   # drop
         rescue StandardError => e
