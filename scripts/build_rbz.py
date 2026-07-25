@@ -47,6 +47,22 @@ def stamp_extension_json(text: str, version: str) -> str:
     return json.dumps(manifest, indent=2) + "\n"
 
 
+def stamp_main(text: str, version: str) -> str:
+    """Set the VERSION constant the extension reports at runtime.
+
+    Missed on the first pass: the constant lives in main.rb, so a 2.2.0 build
+    still logged "Starting server v2.0.0". Every version string in the package
+    is stamped from the tag, and this is the one users actually see.
+    """
+    return re.sub(
+        r"^(\s*VERSION\s*=\s*)['\"][^'\"]*['\"]",
+        lambda m: "{}\"{}\"".format(m.group(1), version),
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+
+
 def stamp_loader(text: str, version: str) -> str:
     """Rewrite ext.version in the loader so it matches the release tag.
 
@@ -80,6 +96,8 @@ def build(version: str, output_dir: Path) -> Path:
                 text = stamp_extension_json(text, version)
             elif arcname == "su_mcp.rb":
                 text = stamp_loader(text, version)
+            elif arcname == "su_mcp/main.rb":
+                text = stamp_main(text, version)
 
             # Fixed timestamp so identical input yields an identical archive.
             info = zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0))
@@ -91,11 +109,36 @@ def build(version: str, output_dir: Path) -> Path:
     return target
 
 
-def verify(path: Path) -> None:
+def verify(path: Path, version: str) -> None:
     """Re-open the archive and assert the layout SketchUp needs."""
     with zipfile.ZipFile(path) as archive:
         names = set(archive.namelist())
         broken = archive.testzip()
+        main_rb = archive.read("su_mcp/main.rb").decode("utf-8")
+        loader = archive.read("su_mcp.rb").decode("utf-8")
+        manifest = json.loads(archive.read("extension.json"))
+
+    # Every version string in the package must come from the tag. main.rb's
+    # VERSION constant was missed originally, so a 2.2.0 build still logged
+    # "Starting server v2.0.0" -- the one version a user actually sees.
+    stamped = {
+        "main.rb VERSION": re.search(r"VERSION\s*=\s*['\"]([^'\"]+)['\"]", main_rb),
+        "loader ext.version": re.search(r"ext\.version\s*=\s*['\"]([^'\"]+)['\"]", loader),
+    }
+    for label, match in stamped.items():
+        found = match.group(1) if match else None
+        if found != version:
+            raise SystemExit(
+                "error: {} is {!r}, expected {!r} -- add it to the stamping step".format(
+                    label, found, version
+                )
+            )
+    if manifest.get("version") != version:
+        raise SystemExit(
+            "error: extension.json version is {!r}, expected {!r}".format(
+                manifest.get("version"), version
+            )
+        )
 
     if broken:
         raise SystemExit("error: corrupt entry in archive: {}".format(broken))
@@ -129,7 +172,7 @@ def main() -> int:
 
     print("Building su_mcp v{}".format(version))
     target = build(version, output_dir)
-    verify(target)
+    verify(target, version)
 
     size_kb = target.stat().st_size / 1024
     print("\nBuilt {} ({:.1f} KB)".format(target.relative_to(ROOT), size_kb))
