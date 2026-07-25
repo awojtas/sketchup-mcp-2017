@@ -45,7 +45,13 @@ module SU_MCP
       @next_cid    = 1
       @in_tick     = false
       @log_level   = parse_log_level(ENV['SKETCHUP_MCP_LOG_LEVEL'] || 'INFO')
-      @log_to_file = ENV['SKETCHUP_MCP_LOG_FILE']  # path, optional
+      # SketchUp's Ruby Console exposes no read API -- Sketchup::Console has no
+      # :text, :history or :to_a -- so console output cannot be retrieved
+      # programmatically, only copied out of the window by hand. Mirroring to a
+      # file by default makes the log available to whoever is debugging.
+      # Set SKETCHUP_MCP_LOG_FILE=none to disable.
+      @log_to_file = ENV['SKETCHUP_MCP_LOG_FILE'] || File.join(Dir.tmpdir, 'sketchup_mcp.log')
+      @log_to_file = nil if @log_to_file.to_s.downcase == 'none'
       @verbose_console = ENV['SKETCHUP_MCP_VERBOSE_CONSOLE'] == '1'
       @request_timeout  = (ENV['SKETCHUP_MCP_TIMEOUT']      || DEFAULT_TIMEOUT).to_i
       @eval_timeout     = (ENV['SKETCHUP_MCP_EVAL_TIMEOUT'] || DEFAULT_EVAL_TIMEOUT).to_i
@@ -798,8 +804,12 @@ module SU_MCP
       
       if entity
         log "Found entity: #{entity.inspect}"
+        deleted_id = entity.entityID
         entity.erase!
-        { success: true }
+        # Return the id rather than nothing. With no payload this serialised to
+        # the bare string "Success", leaving the caller unable to confirm what
+        # was actually deleted.
+        { success: true, id: deleted_id }
       else
         raise "Entity not found"
       end
@@ -952,7 +962,19 @@ module SU_MCP
           perform_export(model, export_path, options, "COLLADA")
           
         when "stl"
-          # Export as STL file
+          # Verified twice on SketchUp Make 2017: this blocks for minutes,
+          # writes no file, and the request times out. model.export enters
+          # SketchUp's native code, where Ruby's Timeout cannot reach it, so
+          # there is no way to bound the call from here -- the only safe option
+          # is to refuse before making it. File > Export still works
+          # interactively, where whatever it is waiting on would be visible.
+          unless ENV['SKETCHUP_MCP_ALLOW_STL'] == '1'
+            raise "STL export is disabled: on SketchUp Make 2017 it blocks " \
+                  "indefinitely without producing a file, and cannot be " \
+                  "interrupted once started. Use File > Export in SketchUp " \
+                  "instead, or set SKETCHUP_MCP_ALLOW_STL=1 to try anyway."
+          end
+
           export_path = File.join(temp_dir, "#{filename}.stl")
           log "Exporting to STL file: #{export_path}"
           
