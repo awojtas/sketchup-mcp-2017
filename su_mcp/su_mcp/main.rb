@@ -102,8 +102,12 @@ module SU_MCP
       accept_pending_client if @client.nil?
       drain_client if @client
     rescue StandardError => e
-      log "Timer error: #{e.message}"
+      # Last line of defence. Whatever went wrong, the current connection is
+      # suspect -- drop it rather than risk retrying the same failure on every
+      # tick for the rest of the session.
+      log "Timer error, dropping connection: #{e.message}"
       log e.backtrace.join("\n")
+      close_client
     end
 
     def accept_pending_client
@@ -126,8 +130,17 @@ module SU_MCP
           @buffer << @client.read_nonblock(65_536)
         rescue IO::WaitReadable
           break
-        rescue EOFError, Errno::ECONNRESET, Errno::EPIPE
+        rescue EOFError
           log "Client disconnected"
+          close_client
+          return
+        rescue StandardError => e
+          # Any other error reading the socket means the connection is gone.
+          # Don't enumerate errno values: Windows alone reports ECONNABORTED,
+          # ECONNRESET, ENOTCONN and friends for the same situation, and an
+          # unhandled one leaves @client set, so every subsequent tick retries
+          # the dead socket and logs the same backtrace forever.
+          log "Dropping connection after read error: #{e.message}"
           close_client
           return
         end

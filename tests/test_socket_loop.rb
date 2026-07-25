@@ -107,6 +107,41 @@ line6 = pump(server, client2)
 check("new client served", line6 && JSON.parse(line6)["id"] == 9, line6.inspect)
 
 client2.close
+20.times { server.send(:poll); sleep 0.005 }
+
+# --- Dead sockets must be dropped, not retried forever ---------------------
+# Windows reports several distinct errno values when a connection dies
+# (ECONNABORTED, ENOTCONN, ...). An unhandled one used to leave @client set,
+# so every tick retried the dead socket and logged the same backtrace --
+# thousands of lines in the Ruby Console. Any read error must drop the client.
+puts "\n7. A socket raising an unexpected errno is dropped, not retried"
+[Errno::ECONNABORTED, Errno::ENOTCONN, IOError].each do |error_class|
+  dead = Object.new
+  dead.define_singleton_method(:read_nonblock) { |*| raise error_class, "simulated" }
+  dead.define_singleton_method(:close) { true }
+
+  server.instance_variable_set(:@client, dead)
+  before = $log_lines.length
+  3.times { server.send(:poll) }
+
+  dropped = server.instance_variable_get(:@client).nil?
+  check("#{error_class} drops the client", dropped)
+  # One report, not one per tick.
+  check("#{error_class} logged once, not per tick",
+        $log_lines[before..-1].grep(/Dropping connection|Timer error/).length <= 1,
+        $log_lines[before..-1].inspect)
+end
+
+# Still able to serve a real client afterwards.
+client3 = TCPSocket.new('127.0.0.1', PORT)
+20.times { server.send(:poll); sleep 0.005 }
+client3.write({ jsonrpc: "2.0", id: 11, method: "prompts/list" }.to_json + "\n")
+client3.flush
+line7 = pump(server, client3)
+check("server still accepts real clients after errors",
+      line7 && JSON.parse(line7)["id"] == 11, line7.inspect)
+client3.close
+
 server.stop
 
 puts "\n#{$failures.zero? ? 'ALL TESTS PASSED' : "#{$failures} FAILURE(S)"}"
