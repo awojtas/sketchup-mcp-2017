@@ -7,6 +7,19 @@
 $LOAD_PATH.unshift File.expand_path("support", __dir__)
 $log_lines = []
 
+# Emulate the parts of SketchUp 2017's Ruby 2.2.4 that modern Ruby has since
+# gained. Without this the suite runs on whatever Ruby is installed, happily
+# accepts 2.4-only methods, and proves nothing about the target platform --
+# Hash#compact on the success-serialisation path broke every tool call on 2017
+# while passing locally.
+#
+# scripts/check_ruby22_compat.py catches these statically; this catches them
+# at runtime, on the paths the tests actually drive.
+class Hash
+  undef_method :compact  if method_defined?(:compact)
+  undef_method :compact! if method_defined?(:compact!)
+end
+
 require 'socket'
 require 'json'
 load File.expand_path("../su_mcp/su_mcp/main.rb", __dir__)
@@ -124,6 +137,26 @@ check("new client served", line6 && JSON.parse(line6)["id"] == 9, line6.inspect)
 
 client2.close
 20.times { server.send(:tick); sleep 0.005 }
+
+# --- The success path must actually serialise --------------------------------
+# Every check above drives error paths or metadata calls. Hash#compact (Ruby
+# 2.4+) sat on the *success* serialiser, so on SketchUp 2017 every tool call
+# that worked died on the way out while failures returned fine. Exercise a
+# successful tool call end to end.
+puts "\n8. A successful tool call serialises its response"
+client4 = TCPSocket.new('127.0.0.1', PORT)
+20.times { server.send(:tick); sleep 0.005 }
+client4.write({ jsonrpc: "2.0", id: 21, method: "tools/call",
+                params: { name: "ping", arguments: {} } }.to_json + "\n")
+client4.flush
+line8 = pump(server, client4)
+parsed8 = line8 ? JSON.parse(line8) : nil
+check("successful tool call returned a response", !parsed8.nil?, line8.inspect)
+check("response is a result, not an error",
+      parsed8 && parsed8["result"] && !parsed8["error"], parsed8.inspect)
+check("no NoMethodError leaked into the response",
+      !(line8.to_s =~ /NoMethodError|undefined method/), line8.inspect)
+client4.close
 
 # --- Dead sockets must be dropped, not retried forever ---------------------
 # Windows reports several distinct errno values when a connection dies
