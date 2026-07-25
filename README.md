@@ -2,12 +2,25 @@
 
 > **This is a fork of [mhyrr/sketchup-mcp](https://github.com/mhyrr/sketchup-mcp).**
 >
-> It exists for two reasons the upstream project doesn't cover:
+> It exists for three reasons the upstream project doesn't cover:
 >
-> 1. **Downloadable releases.** Upstream ships no releases, so you have to build the `.rbz` yourself. This fork publishes a ready-to-install `.rbz` on every tagged release.
-> 2. **SketchUp Make 2017 support.** Make 2017 is the last free desktop SketchUp, and it runs Ruby 2.2.4 with a reduced exporter set. This fork verifies the extension against it and documents what does and doesn't work.
+> 1. **A fix for the UI-freeze bug.** Upstream's extension blocks SketchUp's main thread the moment an MCP client connects, freezing the application until the client disconnects. In practice that means SketchUp hangs as soon as you start Claude, before you've asked it to do anything. Details below.
+> 2. **Downloadable releases.** Upstream ships no releases, so you have to build the `.rbz` yourself — and its build script needs a Ruby gem most people don't have. This fork publishes a ready-to-install `.rbz` on every tagged release.
+> 3. **SketchUp Make 2017 support.** Make 2017 is the last free desktop SketchUp, and it runs Ruby 2.2.4 with a reduced exporter set. This fork verifies the extension against it and documents what does and doesn't work.
 >
-> All credit for the original work goes to [@mhyrr](https://github.com/mhyrr). Non-2017-specific fixes are contributed back upstream where possible.
+> All credit for the original work goes to [@mhyrr](https://github.com/mhyrr). Non-2017-specific fixes are offered back upstream where possible.
+
+### The UI-freeze bug
+
+SketchUp runs Ruby on its **main UI thread**. Upstream's socket loop accepted a connection and then called `client.gets`, which blocks until a newline arrives.
+
+The Python MCP server opens its socket as soon as the process starts and then sends nothing until you invoke a tool. So `gets` waited on data that wasn't coming, the UI thread sat inside that call, and SketchUp greyed out and stopped responding to clicks — recovering only when the MCP server exited and closed the socket.
+
+This fork replaces that with a fully non-blocking loop: each timer tick drains whatever bytes are available and processes any complete messages, never waiting. Partial requests accumulate in a buffer across ticks, and the connection is kept open rather than closed after every request, which is what the Python client expects.
+
+Threads aren't an option here — the SketchUp Ruby API isn't thread-safe, and Ruby threads don't get scheduled while the main thread is blocked anyway.
+
+Two other people hit this independently and proposed fixes upstream ([#7](https://github.com/mhyrr/sketchup-mcp/pull/7) by @Noel-Alex, [#22](https://github.com/mhyrr/sketchup-mcp/pull/22) by @gleydson115-code); both are unmerged. Both cap the blocking read at a short timeout rather than removing it, which leaves the UI thread stalling briefly on every tick and discards partially-received requests when the budget expires. `tests/test_socket_loop.rb` covers that fragmentation case, along with the freeze itself.
 
 SketchupMCP connects Sketchup to Claude AI through the Model Context Protocol (MCP), allowing Claude to directly interact with and control Sketchup. This integration enables prompt-assisted 3D modeling, scene creation, and manipulation in Sketchup.
 

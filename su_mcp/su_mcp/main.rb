@@ -11,6 +11,8 @@ module SU_MCP
       @server = nil
       @running = false
       @timer_id = nil
+      @client = nil
+      @buffer = "".force_encoding(Encoding::BINARY)
     end
 
     # Bring up the Ruby Console. Only called when the user explicitly starts
@@ -49,86 +51,15 @@ module SU_MCP
         
         @server = TCPServer.new('127.0.0.1', @port)
         log "Server created on port #{@port}"
-        
+
         @running = true
-        
-        @timer_id = UI.start_timer(0.1, true) {
-          begin
-            if @running
-              # Check for connection
-              ready = IO.select([@server], nil, nil, 0)
-              if ready
-                log "Connection waiting..."
-                client = @server.accept_nonblock
-                log "Client accepted"
-                
-                data = client.gets
-                log "Raw data: #{data.inspect}"
-                
-                if data
-                  begin
-                    # Parse the raw JSON first to check format
-                    raw_request = JSON.parse(data)
-                    log "Raw parsed request: #{raw_request.inspect}"
-                    
-                    # Extract the original request ID if it exists in the raw data
-                    original_id = nil
-                    if data =~ /"id":\s*(\d+)/
-                      original_id = $1.to_i
-                      log "Found original request ID: #{original_id}"
-                    end
-                    
-                    # Use the raw request directly without transforming it
-                    # Just ensure the ID is preserved if it exists
-                    request = raw_request
-                    if !request["id"] && original_id
-                      request["id"] = original_id
-                      log "Added missing ID: #{original_id}"
-                    end
-                    
-                    log "Processed request: #{request.inspect}"
-                    response = handle_jsonrpc_request(request)
-                    response_json = response.to_json + "\n"
-                    
-                    log "Sending response: #{response_json.strip}"
-                    client.write(response_json)
-                    client.flush
-                    log "Response sent"
-                  rescue JSON::ParserError => e
-                    log "JSON parse error: #{e.message}"
-                    error_response = {
-                      jsonrpc: "2.0",
-                      error: { code: -32700, message: "Parse error" },
-                      id: original_id
-                    }.to_json + "\n"
-                    client.write(error_response)
-                    client.flush
-                  rescue StandardError => e
-                    log "Request error: #{e.message}"
-                    error_response = {
-                      jsonrpc: "2.0",
-                      error: { code: -32603, message: e.message },
-                      id: request ? request["id"] : original_id
-                    }.to_json + "\n"
-                    client.write(error_response)
-                    client.flush
-                  end
-                end
-                
-                client.close
-                log "Client closed"
-              end
-            end
-          rescue IO::WaitReadable
-            # Normal for accept_nonblock
-          rescue StandardError => e
-            log "Timer error: #{e.message}"
-            log e.backtrace.join("\n")
-          end
-        }
-        
+        @client = nil
+        @buffer = "".force_encoding(Encoding::BINARY)
+
+        @timer_id = UI.start_timer(0.1, true) { poll }
+
         log "Server started and listening"
-        
+
       rescue StandardError => e
         log "Error: #{e.message}"
         log e.backtrace.join("\n")
@@ -144,13 +75,126 @@ module SU_MCP
         UI.stop_timer(@timer_id)
         @timer_id = nil
       end
-      
+
+      close_client
+
       @server.close if @server
       @server = nil
       log "Server stopped"
     end
 
     private
+
+    # Everything below runs inside a UI timer, which means it runs on
+    # SketchUp's main thread. Nothing here may block, even briefly: a blocking
+    # socket call freezes the entire application until it returns.
+    #
+    # The original code called client.gets here. The Python client opens its
+    # socket when the MCP server process starts and then sends nothing until a
+    # tool is actually invoked, so gets blocked forever and SketchUp appeared
+    # to hang -- recovering only when the MCP server exited and closed the
+    # socket. Threads are not an option; the SketchUp Ruby API is not
+    # thread-safe and green threads don't get scheduled while the main thread
+    # is blocked. So the loop is fully non-blocking instead.
+    def poll
+      return unless @running
+
+      accept_pending_client if @client.nil?
+      drain_client if @client
+    rescue StandardError => e
+      log "Timer error: #{e.message}"
+      log e.backtrace.join("\n")
+    end
+
+    def accept_pending_client
+      return unless IO.select([@server], nil, nil, 0)
+
+      @client = @server.accept_nonblock
+      @buffer = "".force_encoding(Encoding::BINARY)
+      log "Client connected"
+    rescue IO::WaitReadable, Errno::EINTR
+      # Nothing pending after all -- select can report a spurious ready.
+      nil
+    end
+
+    # Take whatever bytes are available right now, then act on any complete
+    # messages. The buffer persists across timer ticks, so a request split
+    # across TCP segments is reassembled rather than lost.
+    def drain_client
+      loop do
+        begin
+          @buffer << @client.read_nonblock(65_536)
+        rescue IO::WaitReadable
+          break
+        rescue EOFError, Errno::ECONNRESET, Errno::EPIPE
+          log "Client disconnected"
+          close_client
+          return
+        end
+      end
+
+      # The wire protocol is newline-delimited JSON.
+      while (index = @buffer.index("\n"))
+        line = @buffer.slice!(0, index + 1)
+        line = line.strip.force_encoding(Encoding::UTF_8)
+        handle_line(line) unless line.empty?
+        return if @client.nil?
+      end
+    end
+
+    def handle_line(data)
+      request = nil
+      original_id = nil
+
+      begin
+        request = JSON.parse(data)
+
+        # Preserve the id even when the parsed body has lost it.
+        original_id = $1.to_i if data =~ /"id":\s*(\d+)/
+        request["id"] = original_id if !request["id"] && original_id
+
+        log "Processed request: #{request.inspect}"
+        send_response(handle_jsonrpc_request(request))
+      rescue JSON::ParserError => e
+        log "JSON parse error: #{e.message}"
+        send_response({
+          jsonrpc: "2.0",
+          error: { code: -32700, message: "Parse error" },
+          id: original_id
+        })
+      rescue StandardError => e
+        log "Request error: #{e.message}"
+        send_response({
+          jsonrpc: "2.0",
+          error: { code: -32603, message: e.message },
+          id: request ? request["id"] : original_id
+        })
+      end
+    end
+
+    # The connection is deliberately left open. The Python client treats it as
+    # persistent and reuses it across tool calls; closing after each request
+    # forced a reconnect every time.
+    def send_response(response)
+      return if @client.nil?
+
+      @client.write(response.to_json + "\n")
+      @client.flush
+      log "Response sent"
+    rescue StandardError => e
+      log "Failed to send response: #{e.message}"
+      close_client
+    end
+
+    def close_client
+      begin
+        @client.close if @client
+      rescue StandardError
+        nil
+      end
+      @client = nil
+      @buffer = "".force_encoding(Encoding::BINARY)
+    end
 
     def handle_jsonrpc_request(request)
       log "Handling JSONRPC request: #{request.inspect}"
