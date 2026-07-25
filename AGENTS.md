@@ -20,11 +20,15 @@ When adding Ruby, target Ruby 2.2 syntax and guard any API that postdates Sketch
 
 ## Repository layout
 
-- `su_mcp/` — the SketchUp extension (Ruby). `su_mcp.rb` is the loader, `su_mcp/main.rb` is the TCP server and command dispatch, `extension.json` is the manifest, `package.rb` builds the `.rbz`.
+- `su_mcp/` — the SketchUp extension (Ruby). `su_mcp.rb` is the loader, `su_mcp/main.rb` is the TCP server and command dispatch, `extension.json` is the manifest, `package.rb` is upstream's builder.
 - `src/sketchup_mcp/` — the Python MCP server that Claude talks to; bridges MCP to the extension's TCP socket.
+- `scripts/` — build, verification, and dev-loop tooling. Executable helpers belong here, not at the repo root.
+- `docs/` — all documentation. Only `README.md`, `AGENTS.md`, and `CLAUDE.md` are allowed at the root.
 - `examples/` — sample scripts driving the server.
 
 The two halves communicate over a JSON-over-TCP socket on port 9876.
+
+`su_mcp.rb` at the **repo root** is a stale duplicate of the packaged loader at `su_mcp/su_mcp.rb` — older version string, not referenced by anything, and not included in the `.rbz`. Edit the packaged one; the root copy is dead.
 
 ## Documentation Guidelines
 
@@ -66,6 +70,12 @@ To preserve tokens for actual problem-solving:
 - A bug fix doesn't need surrounding cleanup. A one-shot operation doesn't need a helper.
 - Three similar lines beats a premature abstraction.
 - Validate at system boundaries (user input, external APIs). Trust internal code.
+
+### Merging
+
+The repo owner has authorised agents to merge their own PRs here without asking, provided CI is green. Squash-merge and delete the branch. `main` is protected by a ruleset, so everything still goes through a PR — direct pushes to `main` are rejected.
+
+This authorisation covers **this** repo and the owner's other personal repos. It does not extend to `mhyrr/sketchup-mcp` upstream or any repo the owner doesn't control — contributions there follow the normal review process.
 
 ### Fork discipline
 
