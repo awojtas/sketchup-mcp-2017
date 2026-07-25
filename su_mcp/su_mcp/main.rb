@@ -2501,17 +2501,25 @@ module SU_MCP
 
         debug "Code evaluation completed"
 
-        # A5: structured result — try to JSON-serialize; fall back to inspect.
-        value_json = begin
-          JSON.generate(raw_result)
+        # Structured result. JSON.generate refuses a bare scalar at the top
+        # level, so String, boolean and numeric results -- Sketchup.version,
+        # Sketchup.is_pro?, entity counts -- all came back as value: nil even
+        # though they serialise perfectly well. Wrapping in an array proves
+        # serialisability without that restriction.
+        value_ok = begin
+          JSON.generate([raw_result])
+          true
         rescue StandardError
-          nil
+          false
         end
 
         {
           success: true,
           result: {
-            value:   value_json,                    # nil if not JSON-serializable
+            # The value itself, not a pre-encoded string: the response is
+            # serialised as a whole, so callers get a typed result rather than
+            # JSON they have to parse a second time.
+            value:   value_ok ? raw_result : nil,
             inspect: (raw_result.inspect[0, 10_000] rescue raw_result.to_s[0, 10_000]),
             class:   raw_result.class.name
           }
