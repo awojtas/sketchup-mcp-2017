@@ -156,6 +156,31 @@ check("response is a result, not an error",
       parsed8 && parsed8["result"] && !parsed8["error"], parsed8.inspect)
 check("no NoMethodError leaked into the response",
       !(line8.to_s =~ /NoMethodError|undefined method/), line8.inspect)
+
+# --- Payloads must survive serialisation -----------------------------------
+# Handlers that return their data alongside :success rather than under
+# :result -- get_selection is { success: true, entities: [...] } -- used to
+# serialise to the bare string "Success", silently discarding everything.
+# Upstream issue #15.
+puts "\n9. Tool payloads survive serialisation"
+def serialised_text(server, tool_name)
+  response = server.send(:handle_tool_call,
+                         "jsonrpc" => "2.0", "id" => 1,
+                         "params" => { "name" => tool_name, "arguments" => {} })
+  response[:result] && response[:result][:content] && response[:result][:content][0][:text]
+end
+
+# get_selection is the handler upstream issue #15 was filed against.
+[
+  [{ success: true, entities: [{ id: 1, type: "face" }] }, /entities/, "data beside :success"],
+  [{ success: true, result: { count: 7 } },               /count/,    "data under :result"],
+  [{ success: true },                                      /^Success$/, "no payload at all"],
+].each do |handler_result, expected, label|
+  server.define_singleton_method(:get_selection) { handler_result }
+  text = serialised_text(server, "get_selection")
+  check("#{label} -> payload preserved", !(text.to_s =~ expected).nil?, text.inspect)
+end
+
 client4.close
 
 # --- Dead sockets must be dropped, not retried forever ---------------------
