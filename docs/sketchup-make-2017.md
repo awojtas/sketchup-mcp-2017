@@ -78,7 +78,7 @@ Nothing in the extension checks `Sketchup.version`, and `extension.json` declare
 Nobody has run these yet. This is the list that turns "static analysis passed" into "verified".
 
 1. Install the released `.rbz` via Window > Extension Manager; confirm it loads without changing the loading policy, and note the result either way.
-2. Extensions > SketchupMCP > Start Server; confirm the Ruby Console reports the listener on 9876.
+2. Extensions > MCP Server > Start Server; confirm the Ruby Console reports the listener on 9876.
 3. Connect the Python MCP server and run `get_scene_info` against an empty model.
 4. `create_component`, then `get_selected_components`, `transform_component`, `set_material`, `delete_component`.
 5. `eval_ruby` with a trivial expression, then something that raises, to check error propagation.

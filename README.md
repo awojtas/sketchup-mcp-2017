@@ -61,7 +61,7 @@ On SketchUp 2017 the Extension Manager may refuse to load an unsigned extension.
 
 ### Starting the Connection
 
-1. In Sketchup, go to Extensions > SketchupMCP > Start Server
+1. In Sketchup, go to Extensions > MCP Server > Start Server
 2. The server will start on the default port (9876)
 3. Make sure the MCP server is running in your terminal
 

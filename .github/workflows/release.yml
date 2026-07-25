@@ -69,7 +69,7 @@ jobs:
 
           1. Download \`su_mcp_v${VERSION}.rbz\` below.
           2. In SketchUp: **Window > Extension Manager > Install Extension**, and select the file.
-          3. Restart SketchUp. The server is under **Extensions > SketchupMCP > Start Server**.
+          3. Restart SketchUp. The server is under **Extensions > MCP Server > Start Server**.
 
           This extension is unsigned. If SketchUp refuses to load it, open
           Extension Manager > Settings and set the loading policy to **Unrestricted**.
