@@ -487,10 +487,22 @@ module SU_MCP
           # Serialize payload appropriately:
           # - Hash payloads (e.g. new eval_ruby) → JSON text
           # - Scalars → to_s
-          payload_text = case result[:result]
+          # Newer handlers put their payload under :result. The original ones
+          # return it as extra keys alongside :success -- get_selection gives
+          # { success: true, entities: [...] }, for instance. Reading only
+          # :result turned those into the bare string "Success" and threw the
+          # data away, which is upstream issue #15: "get_selection is only
+          # returning a generic Success message without any selection data".
+          payload = result[:result]
+          if payload.nil?
+            extras = result.reject { |k, _v| k == :success }
+            payload = extras.empty? ? nil : extras
+          end
+
+          payload_text = case payload
                         when nil  then "Success"
-                        when Hash, Array then result[:result].to_json
-                        else result[:result].to_s
+                        when Hash, Array then payload.to_json
+                        else payload.to_s
                         end
           response = {
             jsonrpc: request["jsonrpc"] || "2.0",
@@ -499,7 +511,7 @@ module SU_MCP
               isError: false,
               success: true,
               resourceId: result[:id],
-              structured: result[:result].is_a?(Hash) ? result[:result] : nil
+              structured: payload.is_a?(Hash) ? payload : nil
               # Hash#compact is Ruby 2.4+; SketchUp 2017 has 2.2.4. reject is
               # equivalent and works everywhere. This line ran on every
               # successful tool call, so getting it wrong broke all of them.
