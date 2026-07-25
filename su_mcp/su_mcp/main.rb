@@ -4,9 +4,6 @@ require 'socket'
 require 'fileutils'
 require 'tmpdir'
 
-puts "MCP Extension loading..."
-SKETCHUP_CONSOLE.show rescue nil
-
 module SU_MCP
   class Server
     def initialize
@@ -14,15 +11,19 @@ module SU_MCP
       @server = nil
       @running = false
       @timer_id = nil
-      
-      # Try multiple ways to show console
+    end
+
+    # Bring up the Ruby Console. Only called when the user explicitly starts
+    # the server -- doing it at load time popped an empty console on every
+    # SketchUp launch, which is noise for anyone who isn't debugging.
+    def show_console
       begin
         SKETCHUP_CONSOLE.show
-      rescue
+      rescue StandardError
         begin
           Sketchup.send_action("showRubyPanel:")
-        rescue
-          UI.start_timer(0) { SKETCHUP_CONSOLE.show }
+        rescue StandardError
+          UI.start_timer(0) { SKETCHUP_CONSOLE.show rescue nil }
         end
       end
     end
@@ -38,7 +39,11 @@ module SU_MCP
 
     def start
       return if @running
-      
+
+      # Starting the server is a deliberate action, so surfacing the console
+      # here is helpful rather than intrusive -- it's where all the logging goes.
+      show_console
+
       begin
         log "Starting server on localhost:#{@port}..."
         
