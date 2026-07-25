@@ -48,6 +48,11 @@ jobs:
       - name: Check Ruby 2.2 compatibility
         run: python3 scripts/check_ruby22_compat.py
 
+      # Guards the UI-freeze regression: the extension's socket loop runs on
+      # SketchUp's main thread, so a blocking read there hangs the whole app.
+      - name: Socket loop regression tests
+        run: ruby tests/test_socket_loop.rb
+
       - name: Build .rbz
         run: python3 scripts/build_rbz.py --version "${{ steps.version.outputs.version }}"
 
