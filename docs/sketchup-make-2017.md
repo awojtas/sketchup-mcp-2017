@@ -2,7 +2,9 @@
 
 SketchUp Make 2017 is the last free desktop release of SketchUp, and it remains widely used by hobbyists who won't pay for a Pro subscription. This fork targets it explicitly.
 
-**Current status: static analysis complete, live verification not yet done.** Nobody has yet installed the `.rbz` into a real Make 2017 instance and exercised the tools. The findings below come from reading the source against the known constraints of that release.
+**Current status: static analysis complete and enforced in CI; live verification still outstanding.** Nobody has yet installed the `.rbz` into a real Make 2017 instance and exercised the tools, so nothing below is confirmed against running software. The findings come from reading the source against the known constraints of that release.
+
+Compatibility is now checked automatically on every release by `scripts/check_ruby22_compat.py`, which fails the build if any post-Ruby-2.2 syntax appears in the extension. It is a heuristic scanner, not a Ruby 2.2 parser — no Ruby 2.2 build is available on modern CI images — so it catches the constructs people actually reach for, not every conceivable incompatibility.
 
 ## What Make 2017 actually constrains
 
@@ -31,39 +33,41 @@ No calls to API introduced after SketchUp 2017. The extension sticks to long-sta
 
 The TCP listener binds `127.0.0.1` (`main.rb:44`), not `0.0.0.0`. Given the extension exposes an `eval_ruby` command that runs arbitrary Ruby in-process, this matters a great deal — it must stay loopback.
 
-### ❌ OBJ export will fail on Make
+### ❌ OBJ export is Pro-only — now fails with a useful message
 
-`main.rb:613-629` offers `obj` as an export format and calls `model.export`. The OBJ exporter is a Pro feature; on Make 2017 this raises rather than producing a file.
+`export_scene` offers `obj` and calls `model.export`. The OBJ exporter is a Pro feature, so on Make it was never going to work.
 
-The guard around it doesn't help:
+The guard around it did nothing:
 
 ```ruby
 if Sketchup.require("sketchup.rb")
 ```
 
-`Sketchup.require` on an already-loaded file returns a truthy value regardless of whether any exporter is present, so this check always passes. It tests nothing. The same non-guard wraps the `dae` and `stl` branches.
+`Sketchup.require` on an already-loaded file returns truthy regardless of which exporters exist, so the check always passed. The same non-guard wrapped the `dae` and `stl` branches.
 
-**Fix direction:** replace the sham check with a real capability probe (attempt the export and rescue, or gate on `Sketchup.is_pro?`), and return a clear "OBJ export requires SketchUp Pro" message instead of an opaque failure.
+**Fixed.** `obj` is now gated on `Sketchup.is_pro?` and returns "OBJ export requires SketchUp Pro… Use format 'dae' instead." All three formats route through a `perform_export` helper that treats a falsy return, an exception, or a missing output file as a clear "exporter is not available in this SketchUp edition" error rather than an opaque failure.
+
+The underlying limitation stands — you cannot export OBJ from Make. The change is that you now get told why.
 
 ### ⚠️ STL export is uncertain
 
-`main.rb:643-653` offers `stl`. Whether STL export works on a stock Make 2017 depends on whether the SketchUp STL extension is present — it was distributed as a separate Extension Warehouse extension for much of that era rather than being built in. This needs checking on a real install; don't assume either way.
+`export_scene` offers `stl`. Whether it works on a stock Make 2017 depends on whether the SketchUp STL extension is installed — for much of that era it was a separate Extension Warehouse download rather than built in. `perform_export` now surfaces a clear error if the exporter is absent, but which way a stock install falls still needs checking on real hardware.
 
-### ⚠️ `Dir.tmpdir` is called without requiring `tmpdir`
-
-`main.rb:600`:
+### ✅ `Dir.tmpdir` called without requiring `tmpdir` — fixed
 
 ```ruby
 temp_dir = File.join(ENV['TEMP'] || ENV['TMP'] || Dir.tmpdir, "sketchup_exports")
 ```
 
-`tmpdir` is not among the requires at the top of the file. On Windows this is masked because `ENV['TEMP']` is set and short-circuits the expression. On macOS `TEMP` and `TMP` are typically unset, so evaluation reaches `Dir.tmpdir` and raises `NoMethodError` unless something else in the process happened to load `tmpdir` first. Adding `require 'tmpdir'` is a one-line fix.
+`tmpdir` wasn't among the requires. Windows masked it, because `ENV['TEMP']` is set and short-circuits the expression before `Dir.tmpdir` is reached. On macOS `TEMP` and `TMP` are typically unset, so evaluation reached `Dir.tmpdir` and raised `NoMethodError` unless something else had happened to load `tmpdir` first.
 
-### ⚠️ Unsigned extensions may not load
+**Fixed** by adding `require 'tmpdir'` to `main.rb`.
 
-SketchUp 2017's Extension Manager defaults to a restrictive loading policy. An unsigned `.rbz` downloaded from GitHub Releases may be silently refused.
+### ℹ️ Extension signing — optional
 
-Two options: tell users to set the loading policy to Unrestricted (documented in the README), or sign the `.rbz` through the Extension Warehouse Developer Center, which is free and produces a signature SketchUp accepts by default. Signing is the better user experience if releases are meant for a general audience.
+SketchUp's Extension Manager has a loading policy that can restrict unsigned extensions. In practice, Make 2017 installs are commonly configured to allow them, and the repo owner has confirmed their own install loads unsigned extensions without changes.
+
+Releases are therefore shipped unsigned, with the README and release notes explaining how to set the loading policy to Unrestricted if a given install does object. Signing through the Extension Warehouse Developer Center is free and would remove that step for everyone — worth doing eventually, not a blocker.
 
 ### ⚠️ No version guard exists
 

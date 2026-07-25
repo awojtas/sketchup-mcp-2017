@@ -15,15 +15,16 @@ Big Shoutout to [Blender MCP](https://github.com/ahujasid/blender-mcp) for the i
 
 ## SketchUp Make 2017 compatibility
 
-Status: **static analysis passed, live verification pending.** See [`docs/sketchup-make-2017.md`](docs/sketchup-make-2017.md) for the full breakdown.
+Status: **static analysis passed and enforced in CI; live verification pending.** See [`docs/sketchup-make-2017.md`](docs/sketchup-make-2017.md) for the full breakdown.
 
 | Area | Make 2017 |
 |---|---|
-| Ruby syntax (2.2.4) | ✅ No post-2.2 syntax in the extension |
+| Ruby syntax (2.2.4) | ✅ No post-2.2 syntax — checked on every release |
 | SketchUp API surface | ✅ No post-2017 API calls |
 | `.dae` / `.skp` / image export | ✅ Available |
-| `.obj` export | ❌ Pro-only exporter — fails on Make |
-| Extension loading | ⚠️ Unsigned `.rbz` may be blocked by the default loading policy |
+| `.obj` export | ❌ Pro-only exporter — now fails with an explanatory message, use `dae` |
+| `.stl` export | ⚠️ Depends on the SketchUp STL extension being installed |
+| Extension loading | ℹ️ Releases are unsigned; set the loading policy to Unrestricted if yours objects |
 
 ## Features
 
@@ -120,9 +121,29 @@ The system uses a simple JSON-based protocol over TCP sockets:
 * **Commands** are sent as JSON objects with a `type` and optional `params`
 * **Responses** are JSON objects with a `status` and `result` or `message`
 
+## Building and releasing
+
+The extension package is built by a standard-library-only Python script — no Ruby, no `rubyzip`, nothing to install. (Upstream's `su_mcp/package.rb` still works if you have the gem, but needing it is why [mhyrr/sketchup-mcp#10](https://github.com/mhyrr/sketchup-mcp/issues/10) went unanswered for so long.)
+
+```bash
+python3 scripts/build_rbz.py --version 1.6.0   # -> dist/su_mcp_v1.6.0.rbz
+python3 scripts/check_ruby22_compat.py         # fails on any post-Ruby-2.2 syntax
+```
+
+To cut a release, push a tag:
+
+```bash
+git tag v1.6.0
+git push origin v1.6.0
+```
+
+CI checks Ruby 2.2 compatibility, builds the `.rbz`, and publishes a GitHub Release with the file attached. The tag is the only place the version is written — it's stamped into `extension.json` and the loader at build time, so the three version strings can't drift apart again. Builds are byte-for-byte reproducible.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+Fixes that aren't specific to Make 2017 are better sent to [upstream](https://github.com/mhyrr/sketchup-mcp) so everyone benefits.
 
 ## License
 
@@ -136,7 +157,7 @@ MIT — see [`LICENSE`](LICENSE). Original copyright retained for [@mhyrr](https
 - ❓ Architecture designed — `/platform-design`
 - ❓ Platform provisioned — `/platform-provision`
 - ❓ Platform verified — `/platform-verify`
-- ❓ Release-ready — `/repo-release-ready`
+- ✅ Release-ready — `/repo-release-ready`
 - ❓ Requirements drafted — `/requirements-create-from-design`
 - ❓ Requirements validated — `/requirements-validation`
 - ❓ Tasks planned — `/tasks-create-from-requirements`
