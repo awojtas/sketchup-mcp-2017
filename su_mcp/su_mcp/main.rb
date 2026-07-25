@@ -2156,16 +2156,36 @@ module SU_MCP
       steps = 1 if steps < 1
       model = Sketchup.active_model
       raise "No active model" unless model
+      # Sketchup::Model has start_operation / commit_operation /
+      # abort_operation, but no undo_operation -- calling it raises
+      # NoMethodError. The old rescue swallowed that and reported
+      # "undone: 0", which reads as "nothing to undo" rather than "this has
+      # never worked". Programmatic undo goes through the menu action.
       undone = 0
+      errors = []
+
       steps.times do
         begin
-          model.undo_operation
+          if model.respond_to?(:undo_operation)
+            model.undo_operation
+          else
+            Sketchup.send_action("editUndo:")
+          end
           undone += 1
-        rescue StandardError
+        rescue StandardError => e
+          errors << "#{e.class}: #{e.message}"
           break
         end
       end
-      { success: true, result: { undone: undone, requested: steps } }
+
+      result = { undone: undone, requested: steps }
+      # Surface the reason rather than silently under-reporting.
+      result[:errors] = errors unless errors.empty?
+      # send_action posts to SketchUp's UI queue rather than running inline, so
+      # "requested" is what was asked for and dispatched -- the model may not
+      # reflect it until the queue drains. Re-query if you need certainty.
+      result[:dispatched_async] = true unless model.respond_to?(:undo_operation)
+      { success: true, result: result }
     end
 
     # ──────────────────────────────────────────────────────────────────
