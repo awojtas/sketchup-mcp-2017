@@ -75,8 +75,12 @@ module SU_MCP
       end
     end
 
-    # Leveled logger. Writes to console only if WARN+ or @verbose_console set.
-    # Always appends to file if @log_to_file set.
+    # Leveled logger. INFO and above go to the Ruby Console; DEBUG needs
+    # @verbose_console. Lifecycle messages (server starting, listening,
+    # stopping) are INFO, and the console line is the only feedback the menu
+    # items give -- with the threshold at WARN, Start Server appeared to do
+    # nothing at all. Per-request chatter is DEBUG, so this stays quiet in
+    # normal use. Always appends to file if @log_to_file set.
     # Dual signature:
     #   log(level_int, msg_string)  — preferred
     #   log(msg_string)             — legacy, treated as DEBUG
@@ -90,7 +94,7 @@ module SU_MCP
       end
       return if level < @log_level
       line = "[#{Time.now.strftime('%H:%M:%S')}] MCP #{LOG_NAMES[level]}: #{text}"
-      if @verbose_console || level >= LOG_WARN
+      if @verbose_console || level >= LOG_INFO
         begin
           SKETCHUP_CONSOLE.write(line + "\n")
         rescue
