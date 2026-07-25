@@ -34,8 +34,19 @@ end
 
 server = SU_MCP::Server.new
 server.instance_variable_set(:@port, PORT)
+$log_lines.clear
 server.start
 poll = lambda { server.send(:tick) }
+
+# --- Menu feedback ---------------------------------------------------------
+# Start Server gives no other visible confirmation, so if lifecycle messages
+# don't reach the Ruby Console the menu item looks like it does nothing. The
+# imported v2.0.0 logger defaulted the console threshold to WARN, which
+# silenced exactly these lines.
+puts "\n0. Starting the server reports to the Ruby Console"
+check("start wrote to the console", !$log_lines.empty?)
+check("console mentions listening/started",
+      $log_lines.any? { |l| l =~ /listening|starting/i }, $log_lines.inspect)
 
 # --- The regression itself -------------------------------------------------
 # A client that connects and says nothing must not stall the caller. Before the
