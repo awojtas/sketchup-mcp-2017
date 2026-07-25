@@ -20,8 +20,8 @@ Tested against a real Make 2017 install (`17.2.2555`).
 | | |
 |---|---|
 | Core tools | ✅ Working |
-| `.obj` export | ✅ Working |
-| `.stl` export | ❌ Times out mid-export |
+| `.obj` export | ✅ Working — but see the Pro-trial caveat in the docs |
+| `.stl` export | ❌ Refused — hangs SketchUp; use File > Export |
 
 Releases are unsigned. If your Extension Manager refuses to load one, set its loading policy to Unrestricted.
 
