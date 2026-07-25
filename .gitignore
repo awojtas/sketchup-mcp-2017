@@ -33,3 +33,22 @@ ENV/
 ._*
 Thumbs.db
 *.tar.gz
+
+# Editors / IDEs
+.idea/
+.vscode/settings.json
+*.iml
+.history
+
+# Logs
+*.log
+
+# Claude Code temp files and worktrees
+tmpclaude-*-cwd
+tmpclaude*
+.claude/worktrees/
+
+# Screenshots dumped at repo root
+/*.png
+/*.jpeg
+/*.jpg

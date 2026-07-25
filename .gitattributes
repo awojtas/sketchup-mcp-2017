@@ -1,0 +1,54 @@
+# Auto-detect text files and normalise line endings to LF on checkin
+* text=auto
+
+# Common text formats — normalised
+*.js text
+*.jsx text
+*.ts text
+*.tsx text
+*.json text
+*.md text
+*.yml text
+*.yaml text
+*.css text
+*.scss text
+*.html text
+*.xml text
+*.txt text
+*.env text
+
+# Unix scripts — LF
+*.sh text eol=lf
+
+# Windows scripts — CRLF
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Lock files — LF for cross-platform stability
+pnpm-lock.yaml text eol=lf
+package-lock.json text eol=lf
+yarn.lock text eol=lf
+
+# Binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.svg binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.otf binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.tar binary
+
+# Project languages
+*.rb text
+*.py text
+*.rbz binary
