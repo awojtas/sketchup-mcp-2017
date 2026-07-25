@@ -34,6 +34,10 @@ CHECKS = [
     ("endless method definition", re.compile(r"^\s*def\s+[\w.]+(\([^)]*\))?\s*=\s*\S"), "3.0"),
     ("hash value omission", re.compile(r"\{[^}]*\b\w+:\s*[,}]"), "3.1"),
     ("anonymous block forwarding", re.compile(r"\(\s*&\s*\)"), "3.1"),
+    # Not syntax, but a stdlib signature change that fails the same way: in
+    # 2.2 String.new takes only a positional string, so the Hash is coerced
+    # and raises TypeError. Use "".force_encoding(...) instead.
+    ("String.new with keyword args", re.compile(r"String\.new\s*\(\s*\w+:"), "2.3"),
 ]
 
 # Ruby lets you write string literals a dozen ways. Cover the ones that
