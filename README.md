@@ -1,44 +1,31 @@
 # SketchupMCP 2017 - Sketchup Model Context Protocol Integration
 
-> **This is a fork of [mhyrr/sketchup-mcp](https://github.com/mhyrr/sketchup-mcp).**
+> **A fork of [mhyrr/sketchup-mcp](https://github.com/mhyrr/sketchup-mcp)** that adds:
 >
-> It exists for three reasons the upstream project doesn't cover:
+> - **Downloadable releases** — install a `.rbz` from [Releases](https://github.com/awojtas/sketchup-mcp-2017/releases) rather than building it yourself
+> - **A fix for the freeze** — upstream locks SketchUp up whenever an agent connects
+> - **SketchUp Make 2017 support** — tested against the last free desktop version
 >
-> 1. **A fix for the UI-freeze bug.** Upstream's extension blocks SketchUp's main thread the moment an MCP client connects, freezing the application until the client disconnects. In practice that means SketchUp hangs as soon as you start Claude, before you've asked it to do anything. Details below.
-> 2. **Downloadable releases.** Upstream ships no releases, so you have to build the `.rbz` yourself — and its build script needs a Ruby gem most people don't have. This fork publishes a ready-to-install `.rbz` on every tagged release.
-> 3. **SketchUp Make 2017 support.** Make 2017 is the last free desktop SketchUp, and it runs Ruby 2.2.4 with a reduced exporter set. This fork verifies the extension against it and documents what does and doesn't work.
->
-> All credit for the original work goes to [@mhyrr](https://github.com/mhyrr). Non-2017-specific fixes are offered back upstream where possible.
+> Credit for the original work to [@mhyrr](https://github.com/mhyrr).
+> Detail on the fixes: [what this fork changes](docs/fork-changes.md).
 
 SketchupMCP connects Sketchup to Claude AI through the Model Context Protocol (MCP), allowing Claude to directly interact with and control Sketchup. This integration enables prompt-assisted 3D modeling, scene creation, and manipulation in Sketchup.
 
 Big Shoutout to [Blender MCP](https://github.com/ahujasid/blender-mcp) for the inspiration and structure.
 
-### The UI-freeze bug
+## SketchUp Make 2017
 
-SketchUp runs Ruby on its **main UI thread**. Upstream's socket loop accepted a connection and then called `client.gets`, which blocks until a newline arrives.
+Tested against a real Make 2017 install (`17.2.2555`).
 
-The Python MCP server opens its socket as soon as the process starts and then sends nothing until you invoke a tool. So `gets` waited on data that wasn't coming, the UI thread sat inside that call, and SketchUp greyed out and stopped responding to clicks — recovering only when the MCP server exited and closed the socket.
-
-This fork replaces that with a fully non-blocking loop: each timer tick drains whatever bytes are available and processes any complete messages, never waiting. Partial requests accumulate in a buffer across ticks, and the connection is kept open rather than closed after every request, which is what the Python client expects.
-
-Threads aren't an option here — the SketchUp Ruby API isn't thread-safe, and Ruby threads don't get scheduled while the main thread is blocked anyway.
-
-Two other people hit this independently and proposed fixes upstream ([#7](https://github.com/mhyrr/sketchup-mcp/pull/7) by @Noel-Alex, [#22](https://github.com/mhyrr/sketchup-mcp/pull/22) by @gleydson115-code); both are unmerged. Both cap the blocking read at a short timeout rather than removing it, which leaves the UI thread stalling briefly on every tick and discards partially-received requests when the budget expires. `tests/test_socket_loop.rb` covers that fragmentation case, along with the freeze itself.
-
-## SketchUp Make 2017 compatibility
-
-Status: **verified against a real SketchUp Make 2017 install** (`17.2.2555`), with Ruby 2.2 compatibility enforced in CI. See [`docs/sketchup-make-2017.md`](docs/sketchup-make-2017.md) for the full breakdown.
-
-| Area | Make 2017 |
+| | |
 |---|---|
-| Ruby syntax (2.2.4) | ✅ No post-2.2 syntax — checked on every release |
-| SketchUp API surface | ✅ No post-2017 API calls |
-| Core tools (`eval_ruby`, `create_component`, `get_selection`, `ping`) | ✅ Confirmed working on real Make 2017 |
-| `.obj` export | ✅ Confirmed working — contrary to the common "Pro-only" claim |
-| `.stl` export | ❌ Does not complete; connection times out mid-export |
-| `Sketchup.is_pro?` | ⚠️ Returns `true` on Make 2017 — unusable for detecting Make |
-| Extension loading | ℹ️ Releases are unsigned; set the loading policy to Unrestricted if yours objects |
+| Core tools | ✅ Working |
+| `.obj` export | ✅ Working |
+| `.stl` export | ❌ Times out mid-export |
+
+Releases are unsigned. If your Extension Manager refuses to load one, set its loading policy to Unrestricted.
+
+Full breakdown: [`docs/sketchup-make-2017.md`](docs/sketchup-make-2017.md).
 
 ## Features
 
@@ -75,13 +62,6 @@ The `.rbz` you install into SketchUp. It opens a TCP socket on `127.0.0.1:9876` 
 
 Confusingly, this is the thing usually called "the MCP server", because it *is* an MCP server — to Claude. But in its relationship with SketchUp it is the **client**: it opens the connection to port 9876 and sends commands.
 
-So it wears two hats:
-
-| Direction | Role |
-|---|---|
-| Towards Claude | MCP **server** — exposes the tools Claude can call |
-| Towards SketchUp | TCP **client** — connects to the extension and sends it work |
-
 **Your coding agent starts this automatically** once it's registered (see below) — you don't launch it by hand for normal use. You *can* run it manually, which is useful for testing, because you get its log directly in the terminal:
 
 ```bash
@@ -89,15 +69,6 @@ uvx --from git+https://github.com/awojtas/sketchup-mcp-2017 sketchup-mcp
 ```
 
 Run that way it prints its startup log and then waits on stdin. `Connected to SketchUp at localhost:9876` means the extension is running and reachable; `Could not connect` means you haven't started the server in SketchUp. Ctrl+C when done — the agent needs to launch its own copy.
-
-### Which one is broken?
-
-| Symptom | Which half |
-|---|---|
-| Claude reports the MCP server as `failed` | Client — it isn't starting. Check `uv` is installed. |
-| Claude connects, but tool calls fail | Server — the extension isn't started, or SketchUp isn't running |
-| Nothing in the Ruby Console on Start Server | Server — see Troubleshooting |
-| Works, then stops working after reopening SketchUp | Server — restarting SketchUp does not restart it; use the menu again |
 
 ## Installation
 
@@ -135,9 +106,9 @@ On SketchUp 2017 the Extension Manager may refuse to load an unsigned extension.
 
 ### Both halves must run on the same machine
 
-The server binds `127.0.0.1:9876` and the client dials `localhost:9876`. That's loopback on both ends, so **Claude and SketchUp have to be on the same computer**. Running Claude on a different machine from SketchUp will not connect without an SSH tunnel forwarding port 9876.
+Both ends use loopback, so **Claude and SketchUp have to be on the same computer**. Running them on different machines needs an SSH tunnel forwarding port 9876.
 
-This is deliberate: the extension exposes an `eval_ruby` command that executes arbitrary Ruby inside SketchUp. Binding it to anything other than loopback would expose remote code execution to your network.
+That's deliberate — `eval_ruby` executes arbitrary Ruby inside SketchUp, so binding wider would expose remote code execution to your network.
 
 ### Step 1 — start the server (in SketchUp, every session)
 
@@ -190,14 +161,13 @@ Once connected, Claude can interact with Sketchup using the following capabiliti
 
 #### Tools
 
-* `get_scene_info` - Gets information about the current Sketchup scene
-* `get_selected_components` - Gets information about currently selected components
-* `create_component` - Create a new component with specified parameters
-* `delete_component` - Remove a component from the scene
-* `transform_component` - Move, rotate, or scale a component
-* `set_material` - Apply materials to components
-* `export_scene` - Export the current scene to various formats
-* `eval_ruby` - Execute arbitrary Ruby code in SketchUp for advanced operations
+**Modelling** — `create_component`, `delete_component`, `transform_component`, `set_material`, `select`, `undo_last`
+
+**Inspection** — `get_selection`, `measure`, `list_definitions`, `list_instances`, `units_info`, `snapshot`
+
+**Joinery** — `create_dovetail`, `create_finger_joint`, `create_mortise_tenon`
+
+**Other** — `export_scene`, `eval_ruby` (arbitrary Ruby in SketchUp), `batch` (several calls in one undo step), `transaction`, `ping`
 
 ### Example Commands
 
@@ -212,34 +182,26 @@ Here are some examples of what you can ask Claude to do:
 
 ## Troubleshooting
 
-Work out **which half** is at fault first — see [Which one is broken?](#which-one-is-broken) above.
-
-**Claude shows the MCP server as `failed`, error `-32000`.** The client isn't starting, and this error says nothing useful about why. Run it by hand to see the real message:
+**Claude shows the MCP server as `failed`.** Usually `uv` isn't installed, or isn't on `PATH` in the terminal Claude inherited. Install it, restart Claude. To see the real error, run the client by hand:
 
 ```bash
 uvx --from git+https://github.com/awojtas/sketchup-mcp-2017 sketchup-mcp
 ```
 
-Most often `uv` isn't installed, or isn't on `PATH` yet in the terminal Claude inherited. Restart Claude after installing it.
+**Claude connects, but tool calls fail.** The client connects whether or not SketchUp is listening, so a connected client proves nothing about the server. Check SketchUp is open and you've run **Extensions > MCP Server > Start Server** *this session* — it doesn't auto-start, including after a SketchUp restart.
 
-**Claude is connected, but every tool call fails.** The client connects happily whether or not SketchUp is listening — it only warns at startup. So a connected client tells you nothing about the server. Check SketchUp is open and you've run **Extensions > MCP Server > Start Server** this session.
+**Extension Manager still shows the old version after installing a new `.rbz`.** Expected on SketchUp Make 2017: the version isn't refreshed by reopening Extension Manager. Close SketchUp entirely and reopen it, and the correct version appears. The update did install.
 
-**Nothing appears in the Ruby Console when you click Start Server.** On v2.0.0 exactly this happened: lifecycle messages were logged below the console's threshold. Fixed in v2.0.1. If you're on 2.0.0, upgrade. To confirm the listener independently of the console:
+**Not sure the server is listening?**
 
 ```bash
 netstat -ano | findstr 9876          # Windows
 lsof -nP -iTCP:9876 -sTCP:LISTEN     # macOS / Linux
 ```
 
-**It worked, then stopped after restarting SketchUp.** The server does not auto-start. Run the menu item again.
+**Command failures.** The Ruby Console carries the server-side error. For more, set `SKETCHUP_MCP_LOG_LEVEL=DEBUG` and `SKETCHUP_MCP_VERBOSE_CONSOLE=1`.
 
-**Extension Manager shows the old version after installing a new `.rbz`.** It caches the loaded list. Restart SketchUp and check again — the new version is usually installed correctly despite what the dialog says.
-
-**SketchUp freezes when Claude connects.** That's the upstream bug, fixed in v1.7.0. You're running an old build or upstream's.
-
-**Command failures.** The Ruby Console carries the server-side error. For more detail, set `SKETCHUP_MCP_LOG_LEVEL=DEBUG` and `SKETCHUP_MCP_VERBOSE_CONSOLE=1`.
-
-**Timeout errors.** `eval_ruby` is capped (default 30s, `SKETCHUP_MCP_EVAL_TIMEOUT`). Long-running geometry work may need a larger value or breaking into smaller calls.
+**Timeouts.** `eval_ruby` is capped at 30s by default — raise `SKETCHUP_MCP_EVAL_TIMEOUT`, or break the work into smaller calls.
 
 ## Technical Details
 
