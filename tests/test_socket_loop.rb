@@ -26,7 +26,7 @@ end
 def pump(server, client, timeout = 5)
   deadline = Time.now + timeout
   while Time.now < deadline
-    server.send(:poll)
+    server.send(:tick)
     return client.gets if IO.select([client], nil, nil, 0.02)
   end
   nil
@@ -35,7 +35,7 @@ end
 server = SU_MCP::Server.new
 server.instance_variable_set(:@port, PORT)
 server.start
-poll = lambda { server.send(:poll) }
+poll = lambda { server.send(:tick) }
 
 # --- The regression itself -------------------------------------------------
 # A client that connects and says nothing must not stall the caller. Before the
@@ -74,7 +74,7 @@ puts "\n4. Request split across packets is reassembled"
 payload = { jsonrpc: "2.0", id: 3, method: "prompts/list" }.to_json + "\n"
 half = payload.length / 2
 client.write(payload[0...half]); client.flush
-20.times { server.send(:poll); sleep 0.005 }   # first half only; must not be dropped
+20.times { server.send(:tick); sleep 0.005 }   # first half only; must not be dropped
 client.write(payload[half..-1]); client.flush
 line3 = pump(server, client)
 parsed3 = line3 ? JSON.parse(line3) : nil
@@ -96,18 +96,18 @@ check("connection still usable afterwards", line5 && JSON.parse(line5)["id"] == 
 # --- Reconnect -------------------------------------------------------------
 puts "\n6. Server recovers after the client disconnects"
 client.close
-20.times { server.send(:poll); sleep 0.005 }
-check("client slot released", server.instance_variable_get(:@client).nil?)
+20.times { server.send(:tick); sleep 0.005 }
+check("client slot released", server.instance_variable_get(:@clients).empty?)
 
 client2 = TCPSocket.new('127.0.0.1', PORT)
-20.times { server.send(:poll); sleep 0.005 }
+20.times { server.send(:tick); sleep 0.005 }
 client2.write({ jsonrpc: "2.0", id: 9, method: "prompts/list" }.to_json + "\n")
 client2.flush
 line6 = pump(server, client2)
 check("new client served", line6 && JSON.parse(line6)["id"] == 9, line6.inspect)
 
 client2.close
-20.times { server.send(:poll); sleep 0.005 }
+20.times { server.send(:tick); sleep 0.005 }
 
 # --- Dead sockets must be dropped, not retried forever ---------------------
 # Windows reports several distinct errno values when a connection dies
@@ -120,21 +120,21 @@ puts "\n7. A socket raising an unexpected errno is dropped, not retried"
   dead.define_singleton_method(:read_nonblock) { |*| raise error_class, "simulated" }
   dead.define_singleton_method(:close) { true }
 
-  server.instance_variable_set(:@client, dead)
+  server.instance_variable_set(:@clients, [{ id: 99, sock: dead, buffer: "".force_encoding(Encoding::BINARY) }])
   before = $log_lines.length
-  3.times { server.send(:poll) }
+  3.times { server.send(:tick) }
 
-  dropped = server.instance_variable_get(:@client).nil?
+  dropped = server.instance_variable_get(:@clients).empty?
   check("#{error_class} drops the client", dropped)
   # One report, not one per tick.
   check("#{error_class} logged once, not per tick",
-        $log_lines[before..-1].grep(/Dropping connection|Timer error/).length <= 1,
+        $log_lines[before..-1].grep(/error|Dropping|disconnected/i).length <= 1,
         $log_lines[before..-1].inspect)
 end
 
 # Still able to serve a real client afterwards.
 client3 = TCPSocket.new('127.0.0.1', PORT)
-20.times { server.send(:poll); sleep 0.005 }
+20.times { server.send(:tick); sleep 0.005 }
 client3.write({ jsonrpc: "2.0", id: 11, method: "prompts/list" }.to_json + "\n")
 client3.flush
 line7 = pump(server, client3)

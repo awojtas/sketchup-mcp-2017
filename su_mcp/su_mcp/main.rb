@@ -2,22 +2,57 @@ require 'sketchup'
 require 'json'
 require 'socket'
 require 'fileutils'
+require 'timeout'
+require 'logger'
 require 'tmpdir'
 
+puts "MCP Extension loading..."
+
 module SU_MCP
+  # JSON-RPC 2.0 error codes (canonical + custom -320xx range)
+  ERR_PARSE         = -32700
+  ERR_INVALID_REQ   = -32600
+  ERR_METHOD        = -32601
+  ERR_INVALID_PARAM = -32602
+  ERR_INTERNAL      = -32603
+  ERR_TRANSPORT     = -32000
+  ERR_TIMEOUT       = -32001
+  ERR_RUBY_EXC      = -32002
+
+  # Log levels
+  LOG_DEBUG = 0
+  LOG_INFO  = 1
+  LOG_WARN  = 2
+  LOG_ERROR = 3
+  LOG_NAMES = { LOG_DEBUG => "DEBUG", LOG_INFO => "INFO", LOG_WARN => "WARN", LOG_ERROR => "ERROR" }
+
   class Server
-    def initialize
-      @port = 9876
-      @server = nil
-      @running = false
-      @timer_id = nil
-      @client = nil
-      @buffer = "".force_encoding(Encoding::BINARY)
+    DEFAULT_PORT          = 9876
+    DEFAULT_TIMEOUT       = 60      # seconds, per request
+    DEFAULT_EVAL_TIMEOUT  = 30      # seconds, per eval_ruby call
+    POLL_INTERVAL         = 0.05    # seconds between select() polls
+    READ_CHUNK            = 16384   # bytes per non-blocking read
+    MAX_REQUEST_BYTES     = 8 * 1024 * 1024  # 8 MB hard cap
+
+    VERSION = "2.0.0"
+
+    def initialize(port: nil)
+      @port        = (port || ENV['SKETCHUP_MCP_PORT'] || DEFAULT_PORT).to_i
+      @server      = nil
+      @running     = false
+      @timer_id    = nil
+      @clients     = []   # array of {sock:, buffer:, id: }
+      @next_cid    = 1
+      @log_level   = parse_log_level(ENV['SKETCHUP_MCP_LOG_LEVEL'] || 'INFO')
+      @log_to_file = ENV['SKETCHUP_MCP_LOG_FILE']  # path, optional
+      @verbose_console = ENV['SKETCHUP_MCP_VERBOSE_CONSOLE'] == '1'
+      @request_timeout  = (ENV['SKETCHUP_MCP_TIMEOUT']      || DEFAULT_TIMEOUT).to_i
+      @eval_timeout     = (ENV['SKETCHUP_MCP_EVAL_TIMEOUT'] || DEFAULT_EVAL_TIMEOUT).to_i
     end
 
-    # Bring up the Ruby Console. Only called when the user explicitly starts
-    # the server -- doing it at load time popped an empty console on every
-    # SketchUp launch, which is noise for anyone who isn't debugging.
+    # Bring up the Ruby Console. Called from start, not from the constructor:
+    # the extension is constructed when SketchUp loads it at launch, so showing
+    # the console here popped an empty window on every startup.
     def show_console
       begin
         SKETCHUP_CONSOLE.show
@@ -30,184 +65,294 @@ module SU_MCP
       end
     end
 
-    def log(msg)
-      begin
-        SKETCHUP_CONSOLE.write("MCP: #{msg}\n")
-      rescue
-        puts "MCP: #{msg}"
+    def parse_log_level(str)
+      case str.to_s.upcase
+      when 'DEBUG' then LOG_DEBUG
+      when 'INFO'  then LOG_INFO
+      when 'WARN'  then LOG_WARN
+      when 'ERROR' then LOG_ERROR
+      else LOG_INFO
       end
-      STDOUT.flush
     end
+
+    # Leveled logger. Writes to console only if WARN+ or @verbose_console set.
+    # Always appends to file if @log_to_file set.
+    # Dual signature:
+    #   log(level_int, msg_string)  — preferred
+    #   log(msg_string)             — legacy, treated as DEBUG
+    def log(level_or_msg, msg = nil)
+      if msg.nil?
+        level = LOG_DEBUG
+        text = level_or_msg.to_s
+      else
+        level = level_or_msg
+        text = msg.to_s
+      end
+      return if level < @log_level
+      line = "[#{Time.now.strftime('%H:%M:%S')}] MCP #{LOG_NAMES[level]}: #{text}"
+      if @verbose_console || level >= LOG_WARN
+        begin
+          SKETCHUP_CONSOLE.write(line + "\n")
+        rescue
+          puts line
+        end
+      end
+      if @log_to_file
+        begin
+          File.open(@log_to_file, 'a') { |f| f.puts line }
+        rescue
+          # best effort
+        end
+      end
+    end
+
+    def debug(m); log(LOG_DEBUG, m); end
+    def info(m);  log(LOG_INFO, m);  end
+    def warn(m);  log(LOG_WARN, m);  end
+    def error(m); log(LOG_ERROR, m); end
 
     def start
       return if @running
 
       # Starting the server is a deliberate action, so surfacing the console
-      # here is helpful rather than intrusive -- it's where all the logging goes.
+      # here is helpful rather than intrusive -- it is where the logging goes.
       show_console
 
       begin
-        log "Starting server on localhost:#{@port}..."
-        
+        info "Starting server v#{VERSION} on localhost:#{@port}"
         @server = TCPServer.new('127.0.0.1', @port)
-        log "Server created on port #{@port}"
-
         @running = true
-        @client = nil
-        @buffer = "".force_encoding(Encoding::BINARY)
 
-        @timer_id = UI.start_timer(0.1, true) { poll }
-
-        log "Server started and listening"
-
+        @timer_id = UI.start_timer(POLL_INTERVAL, true) { tick }
+        info "Server listening on port #{@port} (timeout=#{@request_timeout}s, eval_timeout=#{@eval_timeout}s, log_level=#{LOG_NAMES[@log_level]})"
       rescue StandardError => e
-        log "Error: #{e.message}"
-        log e.backtrace.join("\n")
+        error "Startup failed: #{e.message}"
+        error e.backtrace.first(5).join("\n")
         stop
       end
     end
 
     def stop
-      log "Stopping server..."
+      info "Stopping server"
       @running = false
-      
-      if @timer_id
-        UI.stop_timer(@timer_id)
-        @timer_id = nil
+
+      UI.stop_timer(@timer_id) if @timer_id
+      @timer_id = nil
+
+      @clients.each do |c|
+        begin c[:sock].close rescue nil end
       end
+      @clients.clear
 
-      close_client
-
-      @server.close if @server
+      @server.close rescue nil
       @server = nil
-      log "Server stopped"
+      info "Server stopped"
     end
 
-    private
-
-    # Everything below runs inside a UI timer, which means it runs on
-    # SketchUp's main thread. Nothing here may block, even briefly: a blocking
-    # socket call freezes the entire application until it returns.
-    #
-    # The original code called client.gets here. The Python client opens its
-    # socket when the MCP server process starts and then sends nothing until a
-    # tool is actually invoked, so gets blocked forever and SketchUp appeared
-    # to hang -- recovering only when the MCP server exited and closed the
-    # socket. Threads are not an option; the SketchUp Ruby API is not
-    # thread-safe and green threads don't get scheduled while the main thread
-    # is blocked. So the loop is fully non-blocking instead.
-    def poll
+    # Single tick of the UI timer: accept new connections, drain existing ones.
+    def tick
       return unless @running
-
-      accept_pending_client if @client.nil?
-      drain_client if @client
+      accept_new_connections
+      service_clients
     rescue StandardError => e
-      # Last line of defence. Whatever went wrong, the current connection is
-      # suspect -- drop it rather than risk retrying the same failure on every
-      # tick for the rest of the session.
-      log "Timer error, dropping connection: #{e.message}"
-      log e.backtrace.join("\n")
-      close_client
+      error "tick error: #{e.message}"
+      error e.backtrace.first(5).join("\n")
     end
 
-    def accept_pending_client
-      return unless IO.select([@server], nil, nil, 0)
-
-      @client = @server.accept_nonblock
-      @buffer = "".force_encoding(Encoding::BINARY)
-      log "Client connected"
-    rescue IO::WaitReadable, Errno::EINTR
-      # Nothing pending after all -- select can report a spurious ready.
-      nil
+    def accept_new_connections
+      loop do
+        ready = IO.select([@server], nil, nil, 0)
+        break unless ready
+        begin
+          sock = @server.accept_nonblock
+          cid = @next_cid
+          @next_cid += 1
+          @clients << { sock: sock, buffer: "".force_encoding(Encoding::BINARY), id: cid }
+          debug "Client ##{cid} connected"
+        rescue IO::WaitReadable, Errno::EAGAIN
+          break
+        end
+      end
     end
 
-    # Take whatever bytes are available right now, then act on any complete
-    # messages. The buffer persists across timer ticks, so a request split
-    # across TCP segments is reassembled rather than lost.
-    def drain_client
+    def service_clients
+      @clients.reject! do |c|
+        begin
+          drain_client(c)
+          false  # keep
+        rescue EOFError, Errno::ECONNRESET, Errno::EPIPE
+          debug "Client ##{c[:id]} disconnected"
+          begin c[:sock].close rescue nil end
+          true   # drop
+        rescue StandardError => e
+          error "Client ##{c[:id]} error: #{e.message}"
+          begin c[:sock].close rescue nil end
+          true
+        end
+      end
+    end
+
+    # Read any pending bytes on the client socket, try to parse as many
+    # JSON messages as possible, dispatch each one, and write responses.
+    # Supports two framing modes:
+    #   1. Concatenated JSON (accumulate buffer, try parse, on success consume prefix)
+    #   2. Newline-delimited JSON (back-compat with v0.1.x clients)
+    def drain_client(client)
+      sock = client[:sock]
+
       loop do
         begin
-          @buffer << @client.read_nonblock(65_536)
-        rescue IO::WaitReadable
-          break
-        rescue EOFError
-          log "Client disconnected"
-          close_client
-          return
-        rescue StandardError => e
-          # Any other error reading the socket means the connection is gone.
-          # Don't enumerate errno values: Windows alone reports ECONNABORTED,
-          # ECONNRESET, ENOTCONN and friends for the same situation, and an
-          # unhandled one leaves @client set, so every subsequent tick retries
-          # the dead socket and logs the same backtrace forever.
-          log "Dropping connection after read error: #{e.message}"
-          close_client
-          return
+          chunk = sock.read_nonblock(READ_CHUNK)
+          if chunk.nil? || chunk.empty?
+            raise EOFError
+          end
+          client[:buffer] << chunk
+        rescue IO::WaitReadable, Errno::EAGAIN
+          break  # no more data for now
+        end
+
+        if client[:buffer].bytesize > MAX_REQUEST_BYTES
+          send_error(sock, nil, ERR_INVALID_REQ, "Request exceeds #{MAX_REQUEST_BYTES} bytes")
+          client[:buffer].clear
+          raise EOFError
         end
       end
 
-      # The wire protocol is newline-delimited JSON.
-      while (index = @buffer.index("\n"))
-        line = @buffer.slice!(0, index + 1)
-        line = line.strip.force_encoding(Encoding::UTF_8)
-        handle_line(line) unless line.empty?
-        return if @client.nil?
+      # Extract and dispatch all complete messages in buffer
+      loop do
+        break if client[:buffer].empty?
+        request, consumed = try_parse_json_prefix(client[:buffer])
+
+        unless request
+          # try_parse_json_prefix reports "invalid" and "incomplete" the same
+          # way, so garbage at the head of the buffer would otherwise sit there
+          # forever: every later request is appended behind it and nothing
+          # parses again until the size cap trips and the client is dropped.
+          # If the buffer cannot possibly become valid JSON, say so and reset.
+          if unparseable_prefix?(client[:buffer])
+            warn "Discarding unparseable input from client ##{client[:id]}"
+            send_error(sock, nil, ERR_PARSE, "Parse error")
+            client[:buffer] = "".force_encoding(Encoding::BINARY)
+            next
+          end
+          break  # genuinely incomplete -- wait for more bytes
+        end
+
+        client[:buffer] = client[:buffer].byteslice(consumed, client[:buffer].bytesize - consumed) || "".force_encoding(Encoding::BINARY)
+        handle_and_respond(sock, request)
       end
     end
 
-    def handle_line(data)
-      request = nil
-      original_id = nil
+    # A JSON-RPC message must begin with { or [. Anything else at the head of
+    # the buffer can never become valid, however many more bytes arrive.
+    def unparseable_prefix?(buffer)
+      text = buffer.dup.force_encoding('UTF-8')
+      text.lstrip!
+      return false if text.nil? || text.empty?
 
+      first = text[0]
+      first != '{' && first != '['
+    end
+
+    # Try to parse a JSON object from the start of +buffer+.
+    # Returns [parsed_hash, bytes_consumed] or [nil, 0] if incomplete/invalid.
+    # Tolerates trailing whitespace/newlines between messages.
+    def try_parse_json_prefix(buffer)
+      text = buffer.dup.force_encoding('UTF-8')
+      text.lstrip!
+      return [nil, 0] if text.empty?
+
+      # Fast path: newline-delimited
+      if idx = text.index("\n")
+        line = text[0..idx].strip
+        if !line.empty?
+          begin
+            parsed = JSON.parse(line)
+            consumed = buffer.bytesize - (text.bytesize - (idx + 1))
+            return [parsed, consumed]
+          rescue JSON::ParserError
+            # fall through to incremental parse
+          end
+        end
+      end
+
+      # Slow path: incremental object parse
+      depth = 0
+      in_string = false
+      escape = false
+      text.each_char.with_index do |ch, i|
+        if in_string
+          if escape
+            escape = false
+          elsif ch == '\\'
+            escape = true
+          elsif ch == '"'
+            in_string = false
+          end
+          next
+        end
+        case ch
+        when '"' then in_string = true
+        when '{' then depth += 1
+        when '}' then
+          depth -= 1
+          if depth == 0
+            candidate = text[0..i]
+            begin
+              parsed = JSON.parse(candidate)
+              consumed = buffer.bytesize - (text.bytesize - (i + 1))
+              return [parsed, consumed]
+            rescue JSON::ParserError
+              return [nil, 0]  # malformed — wait for more or treat as framing error
+            end
+          end
+        end
+      end
+      [nil, 0]
+    end
+
+    def handle_and_respond(sock, request)
+      req_id = request.is_a?(Hash) ? request["id"] : nil
       begin
-        request = JSON.parse(data)
-
-        # Preserve the id even when the parsed body has lost it.
-        original_id = $1.to_i if data =~ /"id":\s*(\d+)/
-        request["id"] = original_id if !request["id"] && original_id
-
-        log "Processed request: #{request.inspect}"
-        send_response(handle_jsonrpc_request(request))
-      rescue JSON::ParserError => e
-        log "JSON parse error: #{e.message}"
-        send_response({
-          jsonrpc: "2.0",
-          error: { code: -32700, message: "Parse error" },
-          id: original_id
-        })
+        response = Timeout::timeout(@request_timeout) { handle_jsonrpc_request(request) }
+        send_response(sock, response)
+      rescue Timeout::Error
+        warn "Request timeout (>#{@request_timeout}s)"
+        send_error(sock, req_id, ERR_TIMEOUT, "Request timed out after #{@request_timeout}s")
       rescue StandardError => e
-        log "Request error: #{e.message}"
-        send_response({
-          jsonrpc: "2.0",
-          error: { code: -32603, message: e.message },
-          id: request ? request["id"] : original_id
-        })
+        error "Handler error: #{e.class}: #{e.message}"
+        error e.backtrace.first(5).join("\n")
+        send_error(sock, req_id, ERR_INTERNAL, e.message, backtrace: e.backtrace.first(5))
       end
     end
 
-    # The connection is deliberately left open. The Python client treats it as
-    # persistent and reuses it across tool calls; closing after each request
-    # forced a reconnect every time.
-    def send_response(response)
-      return if @client.nil?
-
-      @client.write(response.to_json + "\n")
-      @client.flush
-      log "Response sent"
-    rescue StandardError => e
-      log "Failed to send response: #{e.message}"
-      close_client
+    def send_response(sock, response)
+      body = response.to_json + "\n"
+      sock.write(body)
+      sock.flush
+      debug "Sent #{body.bytesize} byte response"
     end
 
-    def close_client
+    def send_error(sock, id, code, message, data: nil, backtrace: nil)
+      payload = {
+        jsonrpc: "2.0",
+        error: { code: code, message: message }.tap { |h|
+          extra = {}
+          extra[:backtrace] = backtrace if backtrace
+          extra.merge!(data) if data.is_a?(Hash)
+          h[:data] = extra unless extra.empty?
+        },
+        id: id
+      }
       begin
-        @client.close if @client
-      rescue StandardError
-        nil
+        sock.write(payload.to_json + "\n")
+        sock.flush
+      rescue StandardError => e
+        error "Failed to send error response: #{e.message}"
       end
-      @client = nil
-      @buffer = "".force_encoding(Encoding::BINARY)
     end
+
+    private
 
     def handle_jsonrpc_request(request)
       log "Handling JSONRPC request: #{request.inspect}"
@@ -307,45 +452,74 @@ module SU_MCP
           create_finger_joint(args)
         when "eval_ruby"
           eval_ruby(args)
+        when "batch"
+          batch(args)
+        when "undo_last"
+          undo_last(args)
+        when "measure"
+          measure(args)
+        when "snapshot"
+          snapshot(args)
+        when "list_definitions"
+          list_definitions(args)
+        when "list_instances"
+          list_instances(args)
+        when "select"
+          select_entities(args)
+        when "units_info"
+          units_info(args)
+        when "transaction"
+          transaction(args)
+        when "ping"
+          { success: true, result: { pong: true, version: VERSION, time: Time.now.to_f } }
         else
           raise "Unknown tool: #{tool_name}"
         end
 
-        log "Tool call result: #{result.inspect}"
+        debug "Tool call result: #{result.inspect[0, 500]}"
         if result[:success]
+          # Serialize payload appropriately:
+          # - Hash payloads (e.g. new eval_ruby) → JSON text
+          # - Scalars → to_s
+          payload_text = case result[:result]
+                        when nil  then "Success"
+                        when Hash, Array then result[:result].to_json
+                        else result[:result].to_s
+                        end
           response = {
             jsonrpc: request["jsonrpc"] || "2.0",
             result: {
-              content: [{ type: "text", text: result[:result] || "Success" }],
+              content: [{ type: "text", text: payload_text }],
               isError: false,
               success: true,
-              resourceId: result[:id]
-            },
+              resourceId: result[:id],
+              structured: result[:result].is_a?(Hash) ? result[:result] : nil
+            }.compact,
             id: request["id"]
           }
-          log "Sending success response: #{response.inspect}"
+          debug "Sending success response (#{payload_text.bytesize} bytes)"
           response
         else
           response = {
             jsonrpc: request["jsonrpc"] || "2.0",
-            error: { 
-              code: -32603, 
-              message: "Operation failed",
+            error: {
+              code: ERR_INTERNAL,
+              message: result[:error] || "Operation failed",
               data: { success: false }
             },
             id: request["id"]
           }
-          log "Sending error response: #{response.inspect}"
+          debug "Sending error response (operation-failed)"
           response
         end
       rescue StandardError => e
-        log "Tool call error: #{e.message}"
+        error "Tool call error: #{e.class}: #{e.message}"
         response = {
           jsonrpc: request["jsonrpc"] || "2.0",
-          error: { 
-            code: -32603, 
+          error: {
+            code: ERR_RUBY_EXC,
             message: e.message,
-            data: { success: false }
+            data: { success: false, backtrace: e.backtrace.first(5) }
           },
           id: request["id"]
         }
@@ -652,30 +826,6 @@ module SU_MCP
       { success: true, entities: selected_entities }
     end
     
-    # SketchUp Make and Pro ship different exporter sets. Sketchup.is_pro? has
-    # been available since long before 2017, but guard the call anyway so an
-    # unexpected edition can't take the whole command down.
-    def pro?
-      Sketchup.respond_to?(:is_pro?) ? Sketchup.is_pro? : false
-    end
-
-    # model.export returns false, or raises, when no exporter is registered for
-    # the target extension. The original code guarded these calls with
-    # Sketchup.require("sketchup.rb") -- always truthy, so it tested nothing and
-    # turned a missing exporter into an opaque failure.
-    def perform_export(model, path, options, label)
-      result = begin
-        model.export(path, options)
-      rescue ArgumentError, NotImplementedError, RuntimeError => e
-        raise "#{label} exporter is not available in this SketchUp edition (#{e.message})"
-      end
-
-      raise "#{label} exporter is not available in this SketchUp edition" unless result
-      raise "#{label} export reported success but wrote no file to #{path}" unless File.exist?(path)
-
-      result
-    end
-
     def export_scene(params)
       log "Exporting scene with params: #{params.inspect}"
       model = Sketchup.active_model
@@ -699,42 +849,49 @@ module SU_MCP
           model.save(export_path)
           
         when "obj"
-          # OBJ is a Pro-only exporter. On Make -- including Make 2017 -- it is
-          # absent, so say so plainly instead of letting model.export fail
-          # somewhere the caller can't interpret.
-          unless pro?
-            raise "OBJ export requires SketchUp Pro. This is SketchUp Make, which " \
-                  "ships the COLLADA and image exporters only. Use format 'dae' instead."
-          end
-
+          # Export as OBJ file
           export_path = File.join(temp_dir, "#{filename}.obj")
           log "Exporting to OBJ file: #{export_path}"
-
-          options = {
-            :triangulated_faces => true,
-            :double_sided_faces => true,
-            :edges => false,
-            :texture_maps => true
-          }
-          perform_export(model, export_path, options, "OBJ")
-
+          
+          # Check if OBJ exporter is available
+          if Sketchup.require("sketchup.rb")
+            options = {
+              :triangulated_faces => true,
+              :double_sided_faces => true,
+              :edges => false,
+              :texture_maps => true
+            }
+            model.export(export_path, options)
+          else
+            raise "OBJ exporter not available"
+          end
+          
         when "dae"
-          # COLLADA ships with Make as well as Pro.
+          # Export as COLLADA file
           export_path = File.join(temp_dir, "#{filename}.dae")
           log "Exporting to COLLADA file: #{export_path}"
-
-          perform_export(model, export_path, { :triangulated_faces => true }, "COLLADA")
-
+          
+          # Check if COLLADA exporter is available
+          if Sketchup.require("sketchup.rb")
+            options = { :triangulated_faces => true }
+            model.export(export_path, options)
+          else
+            raise "COLLADA exporter not available"
+          end
+          
         when "stl"
-          # STL is not built in on every version -- on 2017 it comes from the
-          # separately installed SketchUp STL extension. Attempt it and let
-          # perform_export report clearly if no exporter is registered.
+          # Export as STL file
           export_path = File.join(temp_dir, "#{filename}.stl")
           log "Exporting to STL file: #{export_path}"
-
-          perform_export(model, export_path, { :units => "model" }, "STL")
-
-
+          
+          # Check if STL exporter is available
+          if Sketchup.require("sketchup.rb")
+            options = { :units => "model" }
+            model.export(export_path, options)
+          else
+            raise "STL exporter not available"
+          end
+          
         when "png", "jpg", "jpeg"
           # Export as image
           ext = format.downcase == "jpg" ? "jpeg" : format.downcase
@@ -1903,26 +2060,359 @@ module SU_MCP
       }
     end
     
-    def eval_ruby(params)
-      log "Evaluating Ruby code with length: #{params['code'].length}"
-      
-      begin
-        # Create a safe binding for evaluation
-        binding = TOPLEVEL_BINDING.dup
-        
-        # Evaluate the Ruby code
-        log "Starting code evaluation..."
-        result = eval(params["code"], binding)
-        log "Code evaluation completed with result: #{result.inspect}"
-        
-        # Return success with the result as a string
-        { 
-          success: true,
-          result: result.to_s
+    # ──────────────────────────────────────────────────────────────────
+    # Phase B: batch & undo_last
+    # ──────────────────────────────────────────────────────────────────
+
+    # batch({ "calls": [{"tool": "eval_ruby", "args": {...}}, ...],
+    #         "wrap_undo": true, "undo_name": "MCP batch", "stop_on_error": true })
+    # Runs each sub-call inside ONE model.start_operation / commit_operation,
+    # returning an array of per-call results. Any call that raises either
+    # aborts the whole batch (stop_on_error) or is recorded as an error
+    # entry and the batch continues.
+    def batch(params)
+      calls = Array(params["calls"])
+      wrap_undo     = params["wrap_undo"] != false  # default true
+      undo_name     = params["undo_name"] || "MCP batch"
+      stop_on_error = params["stop_on_error"] != false
+
+      results = []
+      model = Sketchup.active_model
+
+      runner = lambda do
+        calls.each_with_index do |call, i|
+          begin
+            tool_name = call["tool"] || call[:tool]
+            args      = call["args"] || call[:args] || {}
+            sub_req = {
+              "jsonrpc" => "2.0",
+              "method"  => "tools/call",
+              "params"  => { "name" => tool_name, "arguments" => args },
+              "id"      => "batch-#{i}"
+            }
+            resp = handle_tool_call(sub_req)
+            if resp[:error] || resp["error"]
+              err = resp[:error] || resp["error"]
+              msg = err[:message] || err["message"]
+              results << { index: i, success: false, error: msg }
+              raise "batch[#{i}] failed: #{msg}" if stop_on_error
+            else
+              payload = resp[:result] || resp["result"]
+              results << { index: i, success: true, result: payload }
+            end
+          rescue StandardError => e
+            results << { index: i, success: false, error: e.message }
+            raise if stop_on_error
+          end
+        end
+      end
+
+      if wrap_undo && model
+        model.start_operation(undo_name, true)
+        begin
+          runner.call
+          model.commit_operation
+        rescue StandardError => e
+          model.abort_operation rescue nil
+          return { success: false, error: e.message, result: { completed: results.size, results: results } }
+        end
+      else
+        runner.call
+      end
+
+      { success: true, result: { count: results.size, results: results } }
+    end
+
+    # undo_last({ "steps": 1 }) — undo N operations in active model
+    def undo_last(params)
+      steps = (params && params["steps"] || 1).to_i
+      steps = 1 if steps < 1
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      undone = 0
+      steps.times do
+        begin
+          model.undo_operation
+          undone += 1
+        rescue StandardError
+          break
+        end
+      end
+      { success: true, result: { undone: undone, requested: steps } }
+    end
+
+    # ──────────────────────────────────────────────────────────────────
+    # Phase C: new capability tools
+    # ──────────────────────────────────────────────────────────────────
+
+    # measure({ "id": 12345 }) — bounds + position + material + class
+    def measure(params)
+      entity_id = (params["id"] || params["entity_id"]).to_i
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      entity = model.find_entity_by_id(entity_id)
+      raise "No entity with id=#{entity_id}" unless entity
+
+      data = {
+        id: entity_id,
+        class: entity.class.name,
+        valid: entity.valid?
+      }
+      if entity.respond_to?(:bounds)
+        bb = entity.bounds
+        data[:bounds_cm] = {
+          min: bb.min.to_a.map { |v| (v.to_f / 0.393700787).round(3) },
+          max: bb.max.to_a.map { |v| (v.to_f / 0.393700787).round(3) },
+          size: [bb.width, bb.height, bb.depth].map { |v| (v.to_f / 0.393700787).round(3) }
         }
+      end
+      if entity.respond_to?(:transformation)
+        o = entity.transformation.origin
+        data[:position_cm] = o.to_a.map { |v| (v.to_f / 0.393700787).round(3) }
+      end
+      if entity.respond_to?(:material) && entity.material
+        data[:material] = { name: entity.material.display_name, color: entity.material.color.to_a }
+      end
+      if entity.is_a?(Sketchup::ComponentInstance)
+        data[:definition] = entity.definition.name
+      elsif entity.is_a?(Sketchup::Group)
+        data[:group_name] = entity.name
+      end
+      { success: true, result: data }
+    end
+
+    # snapshot({ "width": 1600, "height": 1000, "camera": {...optional...}, "antialias": true })
+    # Renders the current view to a temp PNG and returns the absolute path
+    # plus width/height. Base64 encoding skipped by default (large payload).
+    def snapshot(params)
+      params ||= {}
+      width  = (params["width"]  || 1600).to_i
+      height = (params["height"] || 1000).to_i
+      antialias = params["antialias"] != false
+      compression = (params["compression"] || 0.9).to_f
+      path = params["path"] || File.join(Dir.tmpdir, "sketchup_mcp_snapshot_#{Time.now.to_i}.png")
+
+      model = Sketchup.active_model
+      view = model.active_view
+
+      if params["camera"]
+        cam_p = params["camera"]
+        eye    = Geom::Point3d.new(*cam_p["eye"])    if cam_p["eye"]
+        target = Geom::Point3d.new(*cam_p["target"]) if cam_p["target"]
+        up_v   = Geom::Vector3d.new(*cam_p["up"])    if cam_p["up"]
+        persp  = cam_p.fetch("perspective", true)
+        fov    = cam_p["fov"] || 50.0
+        if eye && target && up_v
+          view.camera = Sketchup::Camera.new(eye, target, up_v, persp, fov)
+        end
+      end
+
+      view.write_image(path, width, height, antialias, compression)
+      { success: true, result: { path: path, width: width, height: height } }
+    end
+
+    # list_definitions({ "name_match": "Sofa", "include_bounds": true })
+    def list_definitions(params)
+      params ||= {}
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      match = params["name_match"]
+      include_bounds = params["include_bounds"] != false
+
+      results = model.definitions.map do |d|
+        entry = {
+          name: d.name,
+          guid: (d.guid rescue nil),
+          instance_count: d.count_instances,
+          is_component: d.is_a?(Sketchup::ComponentDefinition)
+        }
+        if include_bounds
+          bb = d.bounds
+          entry[:bounds_cm] = {
+            size: [bb.width, bb.height, bb.depth].map { |v| (v.to_f / 0.393700787).round(3) }
+          }
+        end
+        entry
+      end
+
+      if match && !match.empty?
+        rx = Regexp.new(match, Regexp::IGNORECASE)
+        # Regexp#match? is Ruby 2.4+; SketchUp 2017 runs 2.2.4. =~ is equivalent
+        # here -- only truthiness is used -- and works on every version.
+        results = results.select { |e| rx =~ e[:name].to_s }
+      end
+
+      { success: true, result: { count: results.size, definitions: results } }
+    end
+
+    # list_instances({ "definition_name": "Single Sofa", "limit": 200,
+    #                  "bounds": { "min": [x,y,z], "max": [x,y,z] } })
+    def list_instances(params)
+      params ||= {}
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      want_def = params["definition_name"]
+      limit = (params["limit"] || 500).to_i
+      bb_filter = params["bounds"]
+
+      collected = []
+      walker = lambda do |ents|
+        ents.each do |e|
+          break if collected.size >= limit
+          case e
+          when Sketchup::ComponentInstance
+            if !want_def || e.definition.name == want_def
+              bb = e.bounds
+              if pass_bb_filter?(bb, bb_filter)
+                collected << {
+                  id: e.entityID,
+                  definition: e.definition.name,
+                  position_cm: e.transformation.origin.to_a.map { |v| (v.to_f / 0.393700787).round(3) },
+                  bounds_min_cm: bb.min.to_a.map { |v| (v.to_f / 0.393700787).round(3) },
+                  bounds_max_cm: bb.max.to_a.map { |v| (v.to_f / 0.393700787).round(3) }
+                }
+              end
+            end
+          when Sketchup::Group
+            if !want_def || e.name == want_def
+              bb = e.bounds
+              if pass_bb_filter?(bb, bb_filter)
+                collected << {
+                  id: e.entityID,
+                  group_name: e.name,
+                  bounds_min_cm: bb.min.to_a.map { |v| (v.to_f / 0.393700787).round(3) },
+                  bounds_max_cm: bb.max.to_a.map { |v| (v.to_f / 0.393700787).round(3) }
+                }
+              end
+            end
+          end
+        end
+      end
+      walker.call(model.entities)
+
+      { success: true, result: { count: collected.size, instances: collected, truncated: collected.size >= limit } }
+    end
+
+    def pass_bb_filter?(bb, filter)
+      return true unless filter
+      min = filter["min"]; max = filter["max"]
+      return true unless min && max
+      !(bb.max.x < min[0] || bb.min.x > max[0] ||
+        bb.max.y < min[1] || bb.min.y > max[1] ||
+        bb.max.z < min[2] || bb.min.z > max[2])
+    end
+
+    # select({ "ids": [1234, 5678] }) — replaces current selection
+    def select_entities(params)
+      params ||= {}
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      ids = Array(params["ids"]).map(&:to_i)
+      model.selection.clear
+      resolved = ids.map { |i| model.find_entity_by_id(i) }.compact
+      model.selection.add(resolved)
+      { success: true, result: { requested: ids.size, selected: resolved.size, missing: ids.size - resolved.size } }
+    end
+
+    # units_info — expose length unit + conversion factors so the client
+    # never has to guess inches vs cm.
+    def units_info(params)
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      opts = model.options["UnitsOptions"]
+      names = { 0 => "inches", 1 => "feet", 2 => "mm", 3 => "cm", 4 => "m" }
+      {
+        success: true,
+        result: {
+          length_unit_code: opts["LengthUnit"],
+          length_unit_name: names[opts["LengthUnit"]] || "unknown",
+          inches_per_cm: 1.cm.to_f,
+          cm_per_inch: (1.0 / 1.cm.to_f),
+          model_title: model.title,
+          model_path: model.path
+        }
+      }
+    end
+
+    # transaction({ "action": "start"|"commit"|"abort", "name": "...", "disable_ui": true })
+    # Gives the client explicit control over undo boundaries when not using
+    # the auto-wrap in eval_ruby / batch.
+    def transaction(params)
+      params ||= {}
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      action = (params["action"] || "start").downcase
+      case action
+      when "start", "begin"
+        model.start_operation(params["name"] || "MCP transaction", params["disable_ui"] != false)
+        { success: true, result: { action: "started" } }
+      when "commit", "end"
+        model.commit_operation
+        { success: true, result: { action: "committed" } }
+      when "abort", "rollback", "cancel"
+        model.abort_operation
+        { success: true, result: { action: "aborted" } }
+      else
+        raise "Unknown transaction action: #{action}"
+      end
+    end
+
+    # ──────────────────────────────────────────────────────────────────
+
+    def eval_ruby(params)
+      code = params["code"].to_s
+      timeout_s = (params["timeout"] || @eval_timeout).to_i
+      wrap_undo = params["wrap_undo"] != false  # default true
+      undo_name = params["undo_name"] || "MCP eval_ruby"
+
+      debug "Evaluating Ruby code (#{code.bytesize} bytes, timeout=#{timeout_s}s, wrap_undo=#{wrap_undo})"
+
+      begin
+        eval_binding = TOPLEVEL_BINDING.dup
+        raw_result = nil
+
+        runner = lambda do
+          raw_result = eval(code, eval_binding)
+        end
+
+        Timeout::timeout(timeout_s, Timeout::Error) do
+          if wrap_undo && Sketchup.active_model
+            Sketchup.active_model.start_operation(undo_name, true)
+            begin
+              runner.call
+              Sketchup.active_model.commit_operation
+            rescue StandardError
+              Sketchup.active_model.abort_operation rescue nil
+              raise
+            end
+          else
+            runner.call
+          end
+        end
+
+        debug "Code evaluation completed"
+
+        # A5: structured result — try to JSON-serialize; fall back to inspect.
+        value_json = begin
+          JSON.generate(raw_result)
+        rescue StandardError
+          nil
+        end
+
+        {
+          success: true,
+          result: {
+            value:   value_json,                    # nil if not JSON-serializable
+            inspect: (raw_result.inspect[0, 10_000] rescue raw_result.to_s[0, 10_000]),
+            class:   raw_result.class.name
+          }
+        }
+      rescue Timeout::Error
+        warn "eval_ruby timed out after #{timeout_s}s"
+        raise "Ruby evaluation timed out after #{timeout_s}s (hint: pass {\"timeout\": N} to increase)"
       rescue StandardError => e
-        log "Error in eval_ruby: #{e.message}"
-        log e.backtrace.join("\n")
+        error "eval_ruby error: #{e.message}"
+        debug e.backtrace.first(10).join("\n")
         raise "Ruby evaluation error: #{e.message}"
       end
     end

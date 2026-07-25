@@ -1,88 +1,87 @@
 # SketchUp Make 2017 compatibility
 
-SketchUp Make 2017 is the last free desktop release of SketchUp, and it remains widely used by hobbyists who won't pay for a Pro subscription. This fork targets it explicitly.
+SketchUp Make 2017 is the last free desktop release of SketchUp, and it remains widely used by hobbyists who won't pay for a subscription. This fork targets it explicitly.
 
-**Current status: static analysis complete and enforced in CI; live verification still outstanding.** Nobody has yet installed the `.rbz` into a real Make 2017 instance and exercised the tools, so nothing below is confirmed against running software. The findings come from reading the source against the known constraints of that release.
+**Status: verified against a real SketchUp Make 2017 install** (`Sketchup.version` → `17.2.2555`, Windows). The findings below are observed behaviour from that machine, not inference. Where something is still unconfirmed, it says so.
 
-Compatibility is now checked automatically on every release by `scripts/check_ruby22_compat.py`, which fails the build if any post-Ruby-2.2 syntax appears in the extension. It is a heuristic scanner, not a Ruby 2.2 parser — no Ruby 2.2 build is available on modern CI images — so it catches the constructs people actually reach for, not every conceivable incompatibility.
+Ruby 2.2 compatibility is additionally enforced on every release by `scripts/check_ruby22_compat.py`, which fails the build if post-2.2 syntax appears in the extension. It's a heuristic scanner, not a Ruby 2.2 parser — no Ruby 2.2 build exists for modern CI images — so it catches the constructs people actually reach for, not every conceivable incompatibility.
 
-## What Make 2017 actually constrains
+## What Make 2017 constrains
 
 | Constraint | Detail |
 |---|---|
 | Ruby version | 2.2.4 (SketchUp 2016 and earlier were 2.0.0; 2021+ moved to 2.7) |
-| Exporters | Make ships a reduced set. COLLADA (`.dae`), KMZ, and 2D image export are available. OBJ, FBX, DWG, DXF, 3DS, VRML are **Pro-only**. |
-| Extension loading | The 2017 Extension Manager has a loading policy setting that defaults to restricting unidentified (unsigned) extensions. |
-| Platform | Windows and macOS only. There is no Linux build, so CI cannot run a real integration test. |
+| Extension loading | The Extension Manager has a loading policy that can restrict unsigned extensions |
+| Platform | Windows and macOS only — no Linux build, so CI cannot run a real integration test |
 
-## Findings
+## Confirmed working
 
-### ✅ Ruby syntax is clean
+| Behaviour | Evidence |
+|---|---|
+| Installs unsigned via Extension Manager | No loading-policy change needed on the test machine |
+| Loads and registers its menu | `Extensions > MCP Server > Start Server` |
+| TCP listener starts | `Server created on port 9876` |
+| MCP client connects | `Client connected`, `ping` round-trips |
+| `eval_ruby` | `Sketchup.version` returned `"17.2.2555"` |
+| `create_component` | Cube created, entity id returned |
+| `get_selection` | Returned an empty selection without error |
+| `export` → `obj` | **Succeeded** — see below; this was not expected |
 
-The extension source uses no syntax introduced after Ruby 2.2. Checked for and found absent: safe navigation (`&.`), squiggly heredocs (`<<~`), `Hash#dig` / `Array#dig`, `String#match?`, `Array#sum`, `Comparable#clamp`, `yield_self` / `then`, `filter_map`, pattern matching, endless method definitions, and hash-value shorthand.
+## Corrections to earlier assumptions
 
-### ✅ SketchUp API surface is clean
+Two claims previously stated here, based on reading the source rather than running it, turned out to be wrong. Recorded because they shaped the code.
 
-No calls to API introduced after SketchUp 2017. The extension sticks to long-stable entry points — `Sketchup.active_model`, `entities`, `definitions`, `materials`, `selection`, `model.export`, `model.save`. Nothing touches `Tags`, `LayerFolder`, `Entities#weld`, `active_path=`, `InstancePath`, or the overlays API, all of which postdate 2017.
+### `Sketchup.is_pro?` returns **true** on Make 2017
 
-### ✅ Dependencies are all standard library
+This was assumed `false` on Make — the obvious reading of the name, and what the Pro/Make exporter split implies. On the test machine it returns `true`.
 
-`su_mcp/su_mcp/main.rb` requires only `sketchup`, `json`, `socket`, and `fileutils` — all present in SketchUp's bundled Ruby. No gems needed at runtime, which is essential since users install a `.rbz` rather than running `bundle install`.
+A gate of the form `raise unless Sketchup.is_pro?` therefore does **not** reliably detect Make, and any such gate should be treated as unsound. One was added to `export_scene` for OBJ and has since been removed.
 
-### ✅ Socket binding is loopback-only
+### OBJ export **works** on Make 2017
 
-The TCP listener binds `127.0.0.1` (`main.rb:44`), not `0.0.0.0`. Given the extension exposes an `eval_ruby` command that runs arbitrary Ruby in-process, this matters a great deal — it must stay loopback.
+The widely-repeated claim is that OBJ is a Pro-only exporter absent from Make. On the test machine, `export` with `format: "obj"` completed and wrote a file:
 
-### ❌ OBJ export is Pro-only — now fails with a useful message
-
-`export_scene` offers `obj` and calls `model.export`. The OBJ exporter is a Pro feature, so on Make it was never going to work.
-
-The guard around it did nothing:
-
-```ruby
-if Sketchup.require("sketchup.rb")
+```
+MCP: Exporting to OBJ file: C:\Users\aidan\AppData\Local\Temp/sketchup_exports/sketchup_export_...obj
+MCP: Export completed successfully to: ...
 ```
 
-`Sketchup.require` on an already-loaded file returns truthy regardless of which exporters exist, so the check always passed. The same non-guard wrapped the `dae` and `stl` branches.
+Whether that's because this install reports itself as Pro, or because Make 2017 genuinely ships the OBJ exporter, isn't yet distinguished. Either way, refusing OBJ up front was wrong, and that check has been removed. If an exporter genuinely is missing, the export call itself reports it.
 
-**Fixed.** `obj` is now gated on `Sketchup.is_pro?` and returns "OBJ export requires SketchUp Pro… Use format 'dae' instead." All three formats route through a `perform_export` helper that treats a falsy return, an exception, or a missing output file as a clear "exporter is not available in this SketchUp edition" error rather than an opaque failure.
+## Open questions
 
-The underlying limitation stands — you cannot export OBJ from Make. The change is that you now get told why.
+### STL export does not complete
 
-### ⚠️ STL export is uncertain
+`export` with `format: "stl"` logged its start line and then the connection dropped, with no success or failure recorded:
 
-`export_scene` offers `stl`. Whether it works on a stock Make 2017 depends on whether the SketchUp STL extension is installed — for much of that era it was a separate Extension Warehouse download rather than built in. `perform_export` now surfaces a clear error if the exporter is absent, but which way a stock install falls still needs checking on real hardware.
-
-### ✅ `Dir.tmpdir` called without requiring `tmpdir` — fixed
-
-```ruby
-temp_dir = File.join(ENV['TEMP'] || ENV['TMP'] || Dir.tmpdir, "sketchup_exports")
+```
+MCP: Exporting to STL file: ...sketchup_export_...stl
+MCP: Client disconnected
 ```
 
-`tmpdir` wasn't among the requires. Windows masked it, because `ENV['TEMP']` is set and short-circuits the expression before `Dir.tmpdir` is reached. On macOS `TEMP` and `TMP` are typically unset, so evaluation reached `Dir.tmpdir` and raised `NoMethodError` unless something else had happened to load `tmpdir` first.
+The likeliest reading is that `model.export` for STL blocked long enough for the client to time out. `model.export` runs on the UI thread, so a hang there stalls SketchUp itself — the same class of problem as the socket bug fixed in v1.7.0, but inside SketchUp's own exporter where we can't fix it.
 
-**Fixed** by adding `require 'tmpdir'` to `main.rb`.
+Needs a repeat run with the console watched: does SketchUp recover, and does a file appear on disk afterwards? STL wasn't built into every SketchUp of that era — it came from a separately installed extension — so "no exporter registered" remains plausible.
 
-### ℹ️ Extension signing — optional
+## Fixed along the way
 
-SketchUp's Extension Manager has a loading policy that can restrict unsigned extensions. In practice, Make 2017 installs are commonly configured to allow them, and the repo owner has confirmed their own install loads unsigned extensions without changes.
+Bugs found and fixed while getting this working on 2017.
 
-Releases are therefore shipped unsigned, with the README and release notes explaining how to set the loading policy to Unrestricted if a given install does object. Signing through the Extension Warehouse Developer Center is free and would remove that step for everyone — worth doing eventually, not a blocker.
+- **SketchUp froze whenever an MCP client connected** (v1.7.0). The socket loop called `client.gets` on SketchUp's UI thread; the Python client connects at startup and stays silent until a tool is invoked, so the UI blocked indefinitely. Now fully non-blocking.
+- **Endless error spam in the Ruby Console** (v1.7.1). `Errno::ECONNABORTED` — what Windows raises when a connection drops — wasn't handled, so the dead socket was retried and re-logged on every tick.
+- **Empty Ruby Console on every launch** (v1.7.0). The console was forced open at load, before anything had logged. It now appears when the server starts.
+- **`Dir.tmpdir` without `require 'tmpdir'`.** Masked on Windows by `ENV['TEMP']`; would raise on macOS.
+- **Export guards that tested nothing.** `if Sketchup.require("sketchup.rb")` is unconditionally truthy.
+- **`String#match?` (Ruby 2.4) and `String.new(encoding:)` (Ruby 2.3)** — both imported with upstream PR #17, both fatal on 2017, both caught by the compatibility checker.
+- **Malformed input wedged the connection.** Also from PR #17: invalid JSON and incomplete JSON were reported identically, so one bad byte sat at the head of the buffer and blocked every subsequent request until the size cap tripped.
 
-### ⚠️ No version guard exists
+## Verification checklist
 
-Nothing in the extension checks `Sketchup.version`, and `extension.json` declares no minimum. If a future change does need a newer API, there's no guard rail to catch it — it will simply break on 2017 at runtime. Worth adding a version check in the loader.
+Still to confirm on a real install:
 
-## Verification checklist for a real Make 2017 install
-
-Nobody has run these yet. This is the list that turns "static analysis passed" into "verified".
-
-1. Install the released `.rbz` via Window > Extension Manager; confirm it loads without changing the loading policy, and note the result either way.
-2. Extensions > MCP Server > Start Server; confirm the Ruby Console reports the listener on 9876.
-3. Connect the Python MCP server and run `get_scene_info` against an empty model.
-4. `create_component`, then `get_selected_components`, `transform_component`, `set_material`, `delete_component`.
-5. `eval_ruby` with a trivial expression, then something that raises, to check error propagation.
-6. `export_scene` for each of `skp`, `dae`, `png` — expect success. Then `obj` and `stl` — record the actual failure mode.
-7. Restart SketchUp and confirm the extension reloads cleanly.
-
-Both Windows and macOS should be covered, since the `tmpdir` issue above is macOS-specific.
+1. STL export — completes, hangs, or errors? Does SketchUp recover?
+2. `export` for `dae` and `png`.
+3. `transform_component`, `set_material`, `delete_component`.
+4. `eval_ruby` raising an error — does it propagate cleanly rather than killing the connection?
+5. The v2.0.0 tools: `batch`, `snapshot`, `measure`, `select`, `list_definitions`, `list_instances`, `units_info`, `undo_last`, `transaction`.
+6. macOS Make 2017 — untried. The `tmpdir` fix is macOS-specific and unexercised.

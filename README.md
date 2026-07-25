@@ -28,15 +28,16 @@ Big Shoutout to [Blender MCP](https://github.com/ahujasid/blender-mcp) for the i
 
 ## SketchUp Make 2017 compatibility
 
-Status: **static analysis passed and enforced in CI; live verification pending.** See [`docs/sketchup-make-2017.md`](docs/sketchup-make-2017.md) for the full breakdown.
+Status: **verified against a real SketchUp Make 2017 install** (`17.2.2555`), with Ruby 2.2 compatibility enforced in CI. See [`docs/sketchup-make-2017.md`](docs/sketchup-make-2017.md) for the full breakdown.
 
 | Area | Make 2017 |
 |---|---|
 | Ruby syntax (2.2.4) | ✅ No post-2.2 syntax — checked on every release |
 | SketchUp API surface | ✅ No post-2017 API calls |
-| `.dae` / `.skp` / image export | ✅ Available |
-| `.obj` export | ❌ Pro-only exporter — now fails with an explanatory message, use `dae` |
-| `.stl` export | ⚠️ Depends on the SketchUp STL extension being installed |
+| Core tools (`eval_ruby`, `create_component`, `get_selection`, `ping`) | ✅ Confirmed working on real Make 2017 |
+| `.obj` export | ✅ Confirmed working — contrary to the common "Pro-only" claim |
+| `.stl` export | ❌ Does not complete; connection times out mid-export |
+| `Sketchup.is_pro?` | ⚠️ Returns `true` on Make 2017 — unusable for detecting Make |
 | Extension loading | ℹ️ Releases are unsigned; set the loading policy to Unrestricted if yours objects |
 
 ## Features
