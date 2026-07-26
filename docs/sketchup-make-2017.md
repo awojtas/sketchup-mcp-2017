@@ -51,6 +51,61 @@ That doesn't change the fix. The guard that was removed (`if Sketchup.require("s
 
 Re-testing exports after 2026-08-24 would settle it.
 
+## Ruby API gaps and traps on 2017
+
+Observed on the same install while driving a long modelling session through `eval_ruby`. Each of these produced a wrong result that looked plausible, so they are worth knowing before you spend a call finding them.
+
+### `Sketchup::DefinitionList#remove` does not exist
+
+```
+NoMethodError: undefined method `remove' for #<Sketchup::DefinitionList>
+```
+
+It arrived in a later SketchUp. On 2017 the only way to drop a definition is `purge_unused`, which removes **every** unused definition — including ones the user wants to keep, like an unplaced scale figure. To purge selectively, give the definitions you want to keep a temporary instance, purge, then erase the instance.
+
+Wrapping the call in `rescue nil` hides the failure and leaves the definitions in place, which is how they end up accumulating unnoticed.
+
+### `pushpull` follows the face normal, so cutting in is always negative
+
+To remove material you pass a **negative** distance regardless of which way the face points. On a downward-facing face a positive distance extrudes a boss *outward* instead of boring a hole. It succeeds, renders convincingly, and only shows up as a bounds check that comes back taller than the part should be.
+
+```ruby
+disc.pushpull(-depth.cm)   # bores, whichever way the face looks
+```
+
+### `add_face` on a circle drawn over an existing face returns `nil`
+
+Drawing a circle coincident with a face **splits** that face rather than creating a new one, so `add_face` has nothing to return. Find the resulting disc instead:
+
+```ruby
+g.entities.add_circle(ctr, Geom::Vector3d.new(0, 0, 1), r, 20)
+disc = g.entities.grep(Sketchup::Face).find do |f|
+  f.normal.z > 0.9 && f.classify_point(ctr) == Sketchup::Face::PointInside
+end
+```
+
+### `BoundingBox` accessors are not named after the axes
+
+`#width` is X, but **`#height` is Y and `#depth` is Z**. Reading `height` as the vertical extent gives a confidently wrong answer for any model that isn't a cube.
+
+### No API reaches dimension text styling
+
+`Sketchup::Dimension` exposes only `arrow_type`, `text`, `plane` and the aligned-text flags. There is no `Sketchup::DimensionStyle` class, the `model.options` providers (`PageOptions`, `UnitsOptions`, `SlideshowOptions`, `NamedOptions`, `PrintOptions`) carry nothing for it, and the model attribute dictionaries hold only `GeoReference`, `temp` and `GSU_ContributorsInfo`.
+
+Font and text size are set in Model Info > Dimensions by hand. Existing dimensions do not pick up the change until **Select all dimensions** then **Update selected dimensions** in that same panel.
+
+### Scene transitions corrupt automated snapshots
+
+Setting `model.pages.selected_page` starts an animated transition. A render taken immediately afterwards captures a frame mid-transition — typically still showing the *previous* scene — while the layer state queried in the same call already reads as correct. The two disagreeing is the tell.
+
+```ruby
+model.options["PageOptions"]["ShowTransition"] = false
+```
+
+### Scenes cannot store where geometry is
+
+A scene saves camera, layer visibility, style, section planes, shadows and axes. It saves nothing about part positions. An exploded view therefore needs a physically moved **duplicate** of the geometry on its own layer — which then has to be kept in step with the original by hand, and silently goes stale when it isn't. Worth saying out loud before offering one.
+
 ## Open questions
 
 ### STL export does not complete
