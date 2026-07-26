@@ -52,7 +52,18 @@ Systematic discovery beats theory-driven fixes.
 
 Good debugging is systematic elimination, not clever solutions.
 
-Extension-side errors surface in SketchUp's Ruby Console (Window > Ruby Console). The extension also logs there via its own `log` helper.
+Extension-side errors surface in SketchUp's Ruby Console (Window > Ruby Console). The extension also logs there via its own `log` helper, and mirrors to `%TEMP%\sketchup_mcp.log` — read the file, since the console has no read-back API.
+
+### Don't call blocking or modal SketchUp APIs from `eval_ruby`
+
+`Sketchup.open_file`, `UI.messagebox` and anything else that opens a dialog or pumps the message loop will **re-enter the extension's timer tick** from inside the tool call, then blow `eval_ruby`'s `Timeout` guard:
+
+```
+tick error: execution expired
+  (mcp eval_ruby):2:in `open_file'
+```
+
+Worse, a modal dialog wedges the socket loop until a human dismisses it, so the agent cannot recover on its own. Opening and closing documents is the user's job — ask, don't drive it.
 
 ## Agent Guidelines
 
