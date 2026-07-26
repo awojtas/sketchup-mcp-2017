@@ -28,6 +28,72 @@ It had never been run against SketchUp 2017 and carried three defects:
 - **`String.new(encoding:)`** — Ruby 2.3+; in 2.2 the Hash is coerced to a String and raises `TypeError`. Two occurrences on the socket read path. Replaced with `"".force_encoding`.
 - **Malformed input wedged the connection.** `try_parse_json_prefix` reported "invalid" and "incomplete" identically, so one bad byte sat at the head of the buffer and blocked every later request until the size cap tripped. Now returns `-32700` and resets.
 
+## The world/local coordinate split (v2.9.0)
+
+`measure` reports bounds in **world** space. `cut_pocket` took its profile in
+centimetres, converted straight to inches, and added the face to the group's
+**local** entities. Those two spaces coincide only while a group sits
+untransformed, which is why this went unnoticed: a freshly created component
+has an identity transform, so the obvious test passes.
+
+Move the component first — which `transform_component` now does correctly —
+and a profile copied from `measure` lands somewhere else entirely. Verified on
+2017: a 10 cm cube moved to x=20, given a profile on its top face in the
+coordinates `measure` had just reported, gained 108 cm³ instead of losing it.
+The profile missed the solid, so push/pull extruded a detached slab. Only
+`cut_pocket`'s volume post-condition caught it.
+
+Profiles are now converted world → local against the target's transformation.
+For an untransformed group that is a no-op, so nothing that already worked
+changes.
+
+## The joinery rebuild (v2.9.0)
+
+`create_mortise_tenon`, `create_dovetail` and `create_finger_joint` were
+disabled in v2.6.0 after live testing found all three destroyed the board they
+were given. They read each board's **world** bounds, then added faces to the
+board's **local** entities — the same defect as above, but unguarded, so the
+damage was committed.
+
+They are rebuilt on the gesture `cut_pocket` already got right: a flat profile
+pushed into a face. Every one of these joints is prismatic, so none of them
+needs SketchUp Pro.
+
+Three things changed in the design, each addressing a way the originals went
+wrong:
+
+- **Geometry comes from the overlap, not from parameters.** The caller
+  positions the two boards so their ends overlap; that intersection *is* the
+  joint. The axis the boards meet along is taken from the separation of their
+  centres, and an ambiguous separation is an error rather than a guess. This
+  replaces the old abstract `width`/`height`/`depth` plus three offsets, which
+  the caller had to reconcile with the boards' real orientation by hand.
+- **Boards are addressed by role, not position.** The socket goes into the
+  board passed as `mortise_id` whichever side of the joint it sits on. Binding
+  cuts to "the board that happens to be lower" is how an operation ends up
+  consuming the solid it meant to keep.
+- **A joint is one operation.** Each joint is several coordinated cuts, and a
+  half-cut joint is worse than none, so all of them run inside a single
+  abortable operation.
+
+### The post-condition
+
+The check that makes this trustworthy is a volume identity. After any of these
+joints the two boards must between them fill the overlap exactly once:
+
+```
+volume(a) + volume(b) == before(a) + before(b) - volume(overlap)
+```
+
+One identity catches material added instead of removed, cuts placed on the
+wrong board, cuts that missed the overlap, gaps, and the two halves
+interpenetrating. It is checked before the operation is committed, so a joint
+that fails leaves the model untouched.
+
+It was tested by deliberately breaking joints — planning no cuts at all, and
+removing the same finger from both boards — and confirming both were rejected
+and rolled back with the boards at their original volumes.
+
 ## Other fixes
 
 - **Empty Ruby Console on every launch** (v1.7.0) — the console was forced open at load, before anything had logged. It now appears when the server starts.
