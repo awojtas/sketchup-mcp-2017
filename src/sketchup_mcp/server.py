@@ -607,7 +607,27 @@ def eval_ruby(
     ctx: Context,
     code: str
 ) -> str:
-    """Evaluate arbitrary Ruby code in Sketchup"""
+    """Evaluate arbitrary Ruby code in SketchUp.
+
+    Units: SketchUp works in INCHES internally, so raw Ruby here returns
+    inches. The purpose-built tools use centimetres at their boundary. Use
+    `.cm` / `.m` on numbers, or convert explicitly, to avoid mixing the two.
+
+    Undo is NOT yours to drive from here. This code runs inside an open
+    operation, so `Sketchup.undo` has nothing to act on and will appear to
+    succeed while changing nothing. To undo, use the `undo_last` tool; to roll
+    back an operation you opened yourself, use `transaction(action="abort")`.
+
+    Boolean/solid operations: prefer the `solid_op` tool. `Group#subtract`
+    subtracts the RECEIVER from the ARGUMENT, which reads backwards, and both
+    operands are consumed and replaced by a new group. Getting it wrong
+    destroys the solid you meant to keep and returns something that looks
+    valid. `Sketchup::Entities` has no `subtract` at all -- only groups and
+    component instances do.
+
+    Constants defined here do NOT leak between calls (each call gets its own
+    module scope), and neither do local variables. Pass state via entityIDs.
+    """
     try:
         logger.info(f"eval_ruby called with code length: {len(code)}")
         
@@ -801,6 +821,43 @@ def transaction(ctx: Context, action: str, name: str = "MCP transaction",
     """
     return _call(ctx, "transaction",
                  {"action": action, "name": name, "disable_ui": disable_ui})
+
+
+@mcp.tool()
+def solid_op(ctx: Context, operation: str, target_id: int, tool_id: int,
+             keep_tool: bool = False) -> str:
+    """Boolean (solid) operation between two solids: subtract, union, intersect.
+
+    Prefer this over calling .subtract/.union/.intersect yourself in eval_ruby.
+    SketchUp's Group#subtract subtracts the RECEIVER from the ARGUMENT, which
+    reads backwards, and getting it wrong destroys the solid you meant to keep
+    while returning a plausible-looking result. This names operands by role and
+    verifies the outcome.
+
+    Args:
+        operation: "subtract", "union" or "intersect".
+                   ("difference"/"intersection" are accepted as aliases.)
+        target_id: entityID of the solid to KEEP and modify.
+        tool_id:   entityID of the solid doing the cutting.
+        keep_tool: leave the tool solid in the model (it is consumed otherwise).
+
+    Both operands must be manifold solids (groups or component instances), and
+    both are consumed: a NEW group is returned, so use the returned id
+    afterwards rather than target_id.
+
+    Returns before/after volume, face count, bounds and manifold state for the
+    target, so a destroyed or inverted result is visible rather than silent.
+    Lengths are centimetres, volumes cubic centimetres.
+
+    Requires SketchUp Pro -- solid operations are absent on Make. Check
+    ping()["capabilities"]["solid_tools"] first.
+    """
+    return _call(ctx, "boolean_operation", {
+        "operation": operation,
+        "target_id": target_id,
+        "tool_id": tool_id,
+        "keep_tool": keep_tool,
+    })
 
 
 @mcp.tool()
