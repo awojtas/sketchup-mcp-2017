@@ -36,6 +36,13 @@ module SU_MCP
 
     VERSION = "2.0.0"
 
+    # Stated once and referenced from tool descriptions. Lengths crossing the
+    # tool boundary are centimetres; SketchUp's own internal unit is inches,
+    # which is what raw Ruby in eval_ruby returns.
+    UNITS_NOTE = "Lengths at the tool boundary are centimetres unless a tool " \
+                 "says otherwise. SketchUp internally uses inches, so raw Ruby " \
+                 "in eval_ruby returns inches."
+
     def initialize(port: nil)
       @port        = (port || ENV['SKETCHUP_MCP_PORT'] || DEFAULT_PORT).to_i
       @server      = nil
@@ -523,7 +530,31 @@ module SU_MCP
         when "transaction"
           transaction(args)
         when "ping"
-          { success: true, result: { pong: true, version: VERSION, time: Time.now.to_f } }
+          {
+            success: true,
+            result: {
+              pong: true,
+              version: VERSION,
+              time: Time.now.to_f,
+              sketchup: {
+                version:        (Sketchup.version rescue nil),
+                version_number: (Sketchup.version_number rescue nil),
+                # is_pro? reports current entitlement, not edition: a fresh Make
+                # install runs a 30-day Pro trial and reports true. Treat it as
+                # "are Pro features available right now", nothing more.
+                is_pro:         (Sketchup.is_pro? rescue nil),
+                locale:         (Sketchup.get_locale rescue nil)
+              },
+              # Version-gated APIs, reported up front so callers can check
+              # rather than discovering absence via NoMethodError mid-operation.
+              capabilities: {
+                solid_tools:         solid_tools_available?,
+                active_section_plane: (Sketchup::Model.instance_methods.include?(:active_section_plane) rescue false),
+                section_planes:       (Sketchup::Entities.instance_methods.include?(:add_section_plane) rescue false)
+              },
+              units: UNITS_NOTE
+            }
+          }
         else
           raise "Unknown tool: #{tool_name}"
         end
@@ -1100,188 +1131,210 @@ module SU_MCP
       end
     end
     
+    # Subtract +cutter_group+ from +solid_group+, returning the resulting group.
+    #
+    # The joinery tools all called Sketchup::Entities#subtract, which does not
+    # exist -- Entities only has intersect_with, which scribes intersection
+    # edges and removes nothing. Confirmed on SketchUp 2017:
+    #   Sketchup::Entities.instance_methods.grep(/subtract/) => []
+    #   Sketchup::Group.instance_methods.grep(/subtract/)    => [:subtract]
+    #
+    # Solid ops also consume BOTH operands and return a NEW group, so the
+    # result has to be captured; anything still holding the original is holding
+    # a deleted entity.
+    def subtract_solid(solid_group, cutter_group, label)
+      unless solid_group.respond_to?(:subtract)
+        raise "#{label} needs solid operations, which are a SketchUp Pro " \
+              "feature and are not available in this edition."
+      end
+
+      result = solid_group.subtract(cutter_group)
+
+      if result.nil? || !result.valid?
+        raise "#{label}: the cut produced no result. The shapes may not " \
+              "overlap, or one of them may not be a manifold solid."
+      end
+
+      result
+    end
+
+    # Solid (boolean) operations.
+    #
+    # Two things make this easy to get catastrophically wrong by hand, which is
+    # why it is a tool rather than something callers write in eval_ruby:
+    #
+    # 1. Sketchup::Group#subtract subtracts the RECEIVER from the ARGUMENT.
+    #    So a.subtract(b) means "b minus a" -- the receiver is the cutter, and
+    #    it reads backwards. Getting it wrong consumes the solid you meant to
+    #    keep and leaves the cutter behind, and the result looks plausible.
+    # 2. Solid operations are a SketchUp Pro feature. On Make they are absent.
+    #
+    # Callers name operands by role -- target is kept, tool does the cutting --
+    # and never have to know the underlying order.
     def boolean_operation(params)
-      log "Performing boolean operation with params: #{params.inspect}"
       model = Sketchup.active_model
-      
-      # Get operation type
-      operation_type = params["operation"]
-      unless ["union", "difference", "intersection"].include?(operation_type)
-        raise "Invalid boolean operation: #{operation_type}. Must be 'union', 'difference', or 'intersection'."
+      raise "No active model" unless model
+
+      operation = normalise_boolean_operation(params["operation"])
+      target = resolve_solid(model, params["target_id"], "target")
+      tool   = resolve_solid(model, params["tool_id"], "tool")
+
+      if target.entityID == tool.entityID
+        raise "target_id and tool_id are the same entity (#{target.entityID})"
       end
-      
-      # Get target and tool entities
-      target_id = params["target_id"].to_s.gsub('"', '')
-      tool_id = params["tool_id"].to_s.gsub('"', '')
-      
-      log "Looking for target entity with ID: #{target_id}"
-      target_entity = model.find_entity_by_id(target_id.to_i)
-      
-      log "Looking for tool entity with ID: #{tool_id}"
-      tool_entity = model.find_entity_by_id(tool_id.to_i)
-      
-      unless target_entity && tool_entity
-        missing = []
-        missing << "target" unless target_entity
-        missing << "tool" unless tool_entity
-        raise "Entity not found: #{missing.join(', ')}"
+
+      unless target.respond_to?(:subtract) && target.respond_to?(:union)
+        raise "Solid operations are not available in this SketchUp edition. " \
+              "They are a SketchUp Pro feature; this appears to be Make."
       end
-      
-      # Ensure both entities are groups or component instances
-      unless (target_entity.is_a?(Sketchup::Group) || target_entity.is_a?(Sketchup::ComponentInstance)) &&
-             (tool_entity.is_a?(Sketchup::Group) || tool_entity.is_a?(Sketchup::ComponentInstance))
-        raise "Boolean operations require groups or component instances"
+
+      before      = solid_stats(target)
+      tool_before = solid_stats(tool)
+
+      unless before[:manifold]
+        raise "target ##{target.entityID} is not a manifold solid, so the result " \
+              "would be undefined. Fix the geometry before a boolean operation."
       end
-      
-      # Create a new group to hold the result
-      result_group = model.active_entities.add_group
-      
-      # Perform the boolean operation
-      case operation_type
-      when "union"
-        log "Performing union operation"
-        perform_union(target_entity, tool_entity, result_group)
-      when "difference"
-        log "Performing difference operation"
-        perform_difference(target_entity, tool_entity, result_group)
-      when "intersection"
-        log "Performing intersection operation"
-        perform_intersection(target_entity, tool_entity, result_group)
+      unless tool_before[:manifold]
+        raise "tool ##{tool.entityID} is not a manifold solid, so the result " \
+              "would be undefined. Fix the geometry before a boolean operation."
       end
-      
-      # Clean up original entities if requested
-      if params["delete_originals"]
-        target_entity.erase! if target_entity.valid?
-        tool_entity.erase! if tool_entity.valid?
+
+      # Solid ops consume both operands. Copy the tool when the caller wants it
+      # to survive, so "keep_tool" does not depend on operand order.
+      operand = params["keep_tool"] ? tool.copy : tool
+
+      # The receiver is the cutter -- see the note above.
+      result = case operation
+               when "subtract"  then operand.subtract(target)
+               when "union"     then operand.union(target)
+               when "intersect" then operand.intersect(target)
+               end
+
+      if result.nil? || !result.valid?
+        raise "#{operation} produced no result. The solids may not intersect, or " \
+              "the operation may be unavailable in this SketchUp edition."
       end
-      
-      # Return the result
-      { 
-        success: true, 
-        id: result_group.entityID
+
+      after = solid_stats(result)
+
+      # The failure this guard exists for: the operands come back inverted, so
+      # what survives is the tool with a bite out of it rather than the target
+      # with a hole in it. That result looks entirely plausible -- manifold,
+      # sensible face count -- and is only caught by rendering the model.
+      #
+      # Both operands are consumed and a new group returned, so the check is on
+      # volume: a subtract can only remove material from whichever solid
+      # survived. If the result matches the tool's starting volume more closely
+      # than the target's, the wrong one survived.
+      if operation == "subtract" && after[:volume_cm3] &&
+         before[:volume_cm3] && tool_before[:volume_cm3]
+        from_target = (before[:volume_cm3] - after[:volume_cm3]).abs
+        from_tool   = (tool_before[:volume_cm3] - after[:volume_cm3]).abs
+
+        if after[:volume_cm3] > before[:volume_cm3] * 1.01
+          raise "subtract produced a solid LARGER than the target " \
+                "(target was #{before[:volume_cm3].round(1)} cm3, result is " \
+                "#{after[:volume_cm3].round(1)} cm3). The wrong operand survived. " \
+                "The model has changed -- use undo_last before retrying."
+        end
+
+        # Only meaningful when the two solids differ in size; with equal volumes
+        # both readings give the same answer and nothing can be concluded.
+        if (before[:volume_cm3] - tool_before[:volume_cm3]).abs > 0.01 &&
+           from_tool < from_target
+          raise "subtract appears to have kept the tool rather than the target " \
+                "(target #{before[:volume_cm3].round(1)} cm3, tool " \
+                "#{tool_before[:volume_cm3].round(1)} cm3, result " \
+                "#{after[:volume_cm3].round(1)} cm3). The model has changed -- " \
+                "use undo_last before retrying, and report this: it means the " \
+                "operand order in boolean_operation is wrong for this SketchUp build."
+        end
+      end
+
+      {
+        success: true,
+        result: {
+          id: result.entityID,
+          operation: operation,
+          target_before: before,
+          result_after: after,
+          tool_kept: params["keep_tool"] ? true : false
+        }
       }
     end
-    
-    def perform_union(target, tool, result_group)
-      model = Sketchup.active_model
-      
-      # Create temporary copies of the target and tool
-      target_copy = target.copy
-      tool_copy = tool.copy
-      
-      # Get the transformation of each entity
-      target_transform = target.transformation
-      tool_transform = tool.transformation
-      
-      # Apply the transformations to the copies
-      target_copy.transform!(target_transform)
-      tool_copy.transform!(tool_transform)
-      
-      # Get the entities from the copies
-      target_entities = target_copy.is_a?(Sketchup::Group) ? target_copy.entities : target_copy.definition.entities
-      tool_entities = tool_copy.is_a?(Sketchup::Group) ? tool_copy.entities : tool_copy.definition.entities
-      
-      # Copy all entities from target to result
-      target_entities.each do |entity|
-        entity.copy(result_group.entities)
-      end
-      
-      # Copy all entities from tool to result
-      tool_entities.each do |entity|
-        entity.copy(result_group.entities)
-      end
-      
-      # Clean up temporary copies
-      target_copy.erase!
-      tool_copy.erase!
-      
-      # Outer shell - this will merge overlapping geometry
-      result_group.entities.outer_shell
+
+    # Solid operations are a SketchUp Pro feature. Checking for the method is
+    # more reliable than is_pro?, which reports entitlement rather than what is
+    # actually callable.
+    def solid_tools_available?
+      Sketchup::Group.instance_methods.include?(:subtract) &&
+        Sketchup::Group.instance_methods.include?(:union)
+    rescue StandardError
+      false
     end
-    
-    def perform_difference(target, tool, result_group)
-      model = Sketchup.active_model
-      
-      # Create temporary copies of the target and tool
-      target_copy = target.copy
-      tool_copy = tool.copy
-      
-      # Get the transformation of each entity
-      target_transform = target.transformation
-      tool_transform = tool.transformation
-      
-      # Apply the transformations to the copies
-      target_copy.transform!(target_transform)
-      tool_copy.transform!(tool_transform)
-      
-      # Get the entities from the copies
-      target_entities = target_copy.is_a?(Sketchup::Group) ? target_copy.entities : target_copy.definition.entities
-      tool_entities = tool_copy.is_a?(Sketchup::Group) ? tool_copy.entities : tool_copy.definition.entities
-      
-      # Copy all entities from target to result
-      target_entities.each do |entity|
-        entity.copy(result_group.entities)
+
+    # Accept the names people reach for, not just one spelling.
+    def normalise_boolean_operation(value)
+      case value.to_s.downcase
+      when "subtract", "difference", "minus" then "subtract"
+      when "union", "add", "join"            then "union"
+      when "intersect", "intersection"       then "intersect"
+      else
+        raise "Invalid operation: #{value.inspect}. " \
+              "Use 'subtract', 'union' or 'intersect'."
       end
-      
-      # Create a temporary group for the tool
-      temp_tool_group = model.active_entities.add_group
-      
-      # Copy all entities from tool to temp group
-      tool_entities.each do |entity|
-        entity.copy(temp_tool_group.entities)
-      end
-      
-      # Subtract the tool from the result
-      result_group.entities.subtract(temp_tool_group.entities)
-      
-      # Clean up temporary copies and groups
-      target_copy.erase!
-      tool_copy.erase!
-      temp_tool_group.erase!
     end
-    
-    def perform_intersection(target, tool, result_group)
-      model = Sketchup.active_model
-      
-      # Create temporary copies of the target and tool
-      target_copy = target.copy
-      tool_copy = tool.copy
-      
-      # Get the transformation of each entity
-      target_transform = target.transformation
-      tool_transform = tool.transformation
-      
-      # Apply the transformations to the copies
-      target_copy.transform!(target_transform)
-      tool_copy.transform!(tool_transform)
-      
-      # Get the entities from the copies
-      target_entities = target_copy.is_a?(Sketchup::Group) ? target_copy.entities : target_copy.definition.entities
-      tool_entities = tool_copy.is_a?(Sketchup::Group) ? tool_copy.entities : tool_copy.definition.entities
-      
-      # Create temporary groups for target and tool
-      temp_target_group = model.active_entities.add_group
-      temp_tool_group = model.active_entities.add_group
-      
-      # Copy all entities from target and tool to temp groups
-      target_entities.each do |entity|
-        entity.copy(temp_target_group.entities)
+
+    def resolve_solid(model, raw_id, role)
+      id = raw_id.to_s.gsub('"', '')
+      raise "#{role}_id is required" if id.empty?
+
+      entity = model.find_entity_by_id(id.to_i)
+      raise "#{role} entity ##{id} not found" unless entity
+
+      unless entity.is_a?(Sketchup::Group) || entity.is_a?(Sketchup::ComponentInstance)
+        raise "#{role} ##{id} is a #{entity.class}; solid operations need a " \
+              "group or component instance"
       end
-      
-      tool_entities.each do |entity|
-        entity.copy(temp_tool_group.entities)
-      end
-      
-      # Perform the intersection
-      result_group.entities.intersect_with(temp_target_group.entities, temp_tool_group.entities)
-      
-      # Clean up temporary copies and groups
-      target_copy.erase!
-      tool_copy.erase!
-      temp_target_group.erase!
-      temp_tool_group.erase!
+
+      entity
     end
-    
+
+    # Enough to tell whether an operation did what the caller intended.
+    # SketchUp works in inches internally; 1 in3 = 16.387064 cm3.
+    def solid_stats(entity)
+      entities = entity.is_a?(Sketchup::Group) ? entity.entities : entity.definition.entities
+      bounds = entity.bounds
+
+      {
+        id: entity.entityID,
+        manifold: (entity.manifold? rescue false),
+        volume_cm3: (entity.volume > 0 ? (entity.volume * 16.387064).round(3) : nil rescue nil),
+        faces: entities.grep(Sketchup::Face).length,
+        bounds_cm: {
+          min:  point_to_cm(bounds.min),
+          max:  point_to_cm(bounds.max),
+          size: [(bounds.width * 2.54).round(3),
+                 (bounds.height * 2.54).round(3),
+                 (bounds.depth * 2.54).round(3)]
+        }
+      }
+    end
+
+    # Build a Point3d from caller-supplied coordinates, scaling into SketchUp's
+    # internal inches.
+    def point_from(coords, scale)
+      Geom::Point3d.new(coords[0].to_f * scale,
+                        coords[1].to_f * scale,
+                        coords[2].to_f * scale)
+    end
+
+    def point_to_cm(point)
+      [(point.x * 2.54).round(3), (point.y * 2.54).round(3), (point.z * 2.54).round(3)]
+    end
+
+
     def chamfer_edges(params)
       log "Chamfering edges with params: #{params.inspect}"
       model = Sketchup.active_model
@@ -1679,8 +1732,10 @@ module SU_MCP
         mortise_face.pushpull(face_direction == :top ? -depth : depth)
       end
       
-      # Subtract the mortise from the board
-      entities.subtract(mortise_group.entities)
+      # Subtract the mortise from the board. Captures the returned group:
+      # the operands are consumed, so the original board is dead after this.
+      board = subtract_solid(board, mortise_group, "create_mortise_tenon")
+      entities = board.entities
       
       # Clean up the temporary group
       mortise_group.erase!
@@ -1969,7 +2024,7 @@ module SU_MCP
         tail_face.pushpull(height)
         
         # Subtract the tail cutout from the pin area
-        pins_group.entities.subtract(tail_cutout_group.entities)
+        pins_group = subtract_solid(pins_group, tail_cutout_group, "create_dovetail")
         
         # Clean up the temporary group
         tail_cutout_group.erase!
@@ -2080,7 +2135,7 @@ module SU_MCP
         cutout_face.pushpull(depth)
         
         # Subtract the cutout from the fingers
-        fingers_group.entities.subtract(cutout_group.entities)
+        fingers_group = subtract_solid(fingers_group, cutout_group, "create_finger_joint")
         
         # Clean up the temporary group
         cutout_group.erase!
@@ -2136,7 +2191,8 @@ module SU_MCP
         cutout_face.pushpull(depth)
         
         # Subtract the cutout from the board
-        entities.subtract(cutout_group.entities)
+        board = subtract_solid(board, cutout_group, "create_finger_joint")
+        entities = board.entities
         
         # Clean up the temporary group
         cutout_group.erase!
@@ -2306,8 +2362,15 @@ module SU_MCP
 
       if params["camera"]
         cam_p = params["camera"]
-        eye    = Geom::Point3d.new(*cam_p["eye"])    if cam_p["eye"]
-        target = Geom::Point3d.new(*cam_p["target"]) if cam_p["target"]
+        # Camera coordinates are centimetres, matching measure and the rest of
+        # the tool boundary. Geom::Point3d takes inches, so convert. Previously
+        # these were passed straight through as inches, which silently placed
+        # the camera ~2.5x too close -- often inside the model, producing a
+        # render of the inside of a wall with no indication anything was wrong.
+        # Pass units: "in" to supply SketchUp internal units instead.
+        to_inches = (cam_p["units"].to_s.downcase == "in") ? 1.0 : (1.0 / 2.54)
+        eye    = point_from(cam_p["eye"], to_inches)    if cam_p["eye"]
+        target = point_from(cam_p["target"], to_inches) if cam_p["target"]
         up_v   = Geom::Vector3d.new(*cam_p["up"])    if cam_p["up"]
         persp  = cam_p.fetch("perspective", true)
         fov    = cam_p["fov"] || 50.0
@@ -2472,16 +2535,38 @@ module SU_MCP
       code = params["code"].to_s
       timeout_s = (params["timeout"] || @eval_timeout).to_i
       wrap_undo = params["wrap_undo"] != false  # default true
+
+      # Sketchup.undo exists, but calling it from here does not do what people
+      # expect: eval_ruby wraps submitted code in start_operation/commit_operation
+      # by default, so an undo issued mid-operation has nothing to act on and
+      # returns without changing the model. Reported as "succeeded and changed
+      # nothing", which is the worst outcome when someone is recovering from a
+      # bad edit. Redirect to the tools that own undo.
+      if wrap_undo && code =~ /\bSketchup\s*\.\s*undo\b/
+        raise "Sketchup.undo does nothing here: eval_ruby runs inside an open " \
+              "operation, so there is nothing for it to undo. Use the undo_last " \
+              "tool instead, or transaction(action: \"abort\") to roll back an " \
+              "operation you opened yourself. Pass wrap_undo: false if you " \
+              "genuinely need to drive undo from inside eval_ruby."
+      end
       undo_name = params["undo_name"] || "MCP eval_ruby"
 
       debug "Evaluating Ruby code (#{code.bytesize} bytes, timeout=#{timeout_s}s, wrap_undo=#{wrap_undo})"
 
       begin
-        eval_binding = TOPLEVEL_BINDING.dup
+        # Evaluate inside a throwaway module so each call gets its own constant
+        # namespace. Previously this used TOPLEVEL_BINDING.dup, and constants
+        # leaked between calls -- "warning: already initialized constant E".
+        #
+        # module_eval is what does the work, not the binding: constant
+        # assignment follows lexical scope, so eval(code, some_binding) still
+        # defines constants on Object no matter which binding is passed.
+        # Top-level constants (Sketchup, Geom, Math) still resolve normally.
+        eval_scope = Module.new
         raw_result = nil
 
         runner = lambda do
-          raw_result = eval(code, eval_binding)
+          raw_result = eval_scope.module_eval(code, "(mcp eval_ruby)", 1)
         end
 
         Timeout::timeout(timeout_s, Timeout::Error) do
