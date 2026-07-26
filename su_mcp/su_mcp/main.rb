@@ -519,6 +519,8 @@ module SU_MCP
           create_text(args)
         when "create_components"
           create_components(args)
+        when "array_copy"
+          array_copy(args)
         when "eval_ruby"
           eval_ruby(args)
         when "batch"
@@ -633,6 +635,102 @@ module SU_MCP
         }
         log "Sending error response: #{response.inspect}"
         response
+      end
+    end
+
+    # Repeat an entity along a vector -- slats, pickets, balusters, shelves,
+    # drawer runs.
+    #
+    # This is the one thing create_components cannot express: it repeats a
+    # FINISHED entity, whatever that entity is. A board with a dovetail
+    # already cut into it, a whole assembly, a component instance -- all
+    # repeat as they are, where listing primitives out would mean rebuilding
+    # the joinery on every one.
+    #
+    # entity.copy preserves the type, so a Group stays a Group and a
+    # ComponentInstance stays an instance sharing its definition.
+    def array_copy(params)
+      model = Sketchup.active_model
+      raise "No active model" unless model
+
+      reject_unknown_params!(params, %w[id count offset], "array_copy")
+      source = resolve_solid(model, params["id"], "source")
+
+      count = (params["count"] || 0).to_i
+      if count < 2
+        raise "count must be at least 2 -- it is the total number of items in " \
+              "the finished array, including the original, so count 12 adds 11 copies"
+      end
+
+      offset = params["offset"]
+      unless offset.is_a?(Array) && offset.length == 3
+        raise "offset must be [dx, dy, dz] in cm -- the step from one item to the next"
+      end
+      step_cm = offset.map { |v| v.to_f }
+      if step_cm.all? { |v| v.abs < 1e-6 }
+        raise "offset is zero, so every copy would land on top of the original"
+      end
+
+      before = solid_stats(source)
+      source_transform = source.transformation
+
+      committed = false
+      copies = []
+      begin
+        model.start_operation("MCP array_copy", true)
+
+        (1...count).each do |i|
+          copy = source.copy
+          raise "copy #{i} failed" unless copy && copy.valid?
+          shift = Geom::Transformation.translation(
+            Geom::Vector3d.new(step_cm[0] * i / 2.54,
+                               step_cm[1] * i / 2.54,
+                               step_cm[2] * i / 2.54))
+          # Pre-multiply: the step is a world-space move, not a local one.
+          copy.transformation = shift * source_transform
+          copies << copy
+        end
+
+        # Each copy must sit exactly one step further along than the last.
+        # Getting this wrong is how an array comes out at 2.54x its spacing,
+        # or with the steps accumulating twice.
+        stats = copies.each_with_index.map do |copy, idx|
+          i = idx + 1
+          after = solid_stats(copy)
+          (0..2).each do |axis|
+            want = before[:bounds_cm][:min][axis] + step_cm[axis] * i
+            got  = after[:bounds_cm][:min][axis]
+            if (got - want).abs > 0.01
+              raise "copy #{i} landed at #{got.round(3)} cm on " \
+                    "#{AXIS_NAMES[axis]} where #{want.round(3)} was expected, " \
+                    "so the spacing is wrong. Nothing was created."
+            end
+          end
+          if before[:manifold] && !after[:manifold]
+            raise "copy #{i} is not a solid although the original is. " \
+                  "Nothing was created."
+          end
+          after
+        end
+
+        model.commit_operation
+        committed = true
+
+        {
+          success: true,
+          result: {
+            count: count,
+            ids: [source.entityID] + copies.map { |c| c.entityID },
+            added: copies.length,
+            offset_cm: step_cm,
+            source: before,
+            copies: stats
+          }
+        }
+      ensure
+        if !committed && model.respond_to?(:abort_operation)
+          model.abort_operation rescue nil
+        end
       end
     end
 
