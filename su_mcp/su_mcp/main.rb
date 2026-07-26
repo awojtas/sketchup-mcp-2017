@@ -5,6 +5,7 @@ require 'fileutils'
 require 'timeout'
 require 'logger'
 require 'tmpdir'
+require 'stringio'
 
 puts "MCP Extension loading..."
 
@@ -635,8 +636,13 @@ module SU_MCP
       entities = model.active_entities
       log "Got active entities: #{entities.inspect}"
       
-      pos = params["position"] || [0,0,0]
-      dims = params["dimensions"] || [1,1,1]
+      # Lengths at the tool boundary are centimetres; SketchUp geometry is
+      # inches. This was passing values through raw, so asking for a 10cm cube
+      # produced a 25.4cm one -- no error, and dimensionally plausible enough to
+      # go unnoticed. Pass units: "in" to supply SketchUp internal units.
+      scale = (params["units"].to_s.downcase == "in") ? 1.0 : (1.0 / 2.54)
+      pos  = (params["position"]   || [0, 0, 0]).map { |v| v.to_f * scale }
+      dims = (params["dimensions"] || [1, 1, 1]).map { |v| v.to_f * scale }
       
       case params["type"]
       when "cube"
@@ -654,7 +660,7 @@ module SU_MCP
           )
           log "Created face: #{face.inspect}"
           
-          face.pushpull(dims[2])
+          extrude_up(face, dims[2])
           log "Pushed/pulled face by #{dims[2]}"
           
           result = { 
@@ -698,7 +704,7 @@ module SU_MCP
           face = group.entities.add_face(circle_points)
           
           # Extrude the face to create the cylinder
-          face.pushpull(height)
+          extrude_up(face, height)
           
           result = { 
             id: group.entityID,
@@ -1133,6 +1139,17 @@ module SU_MCP
       end
     end
     
+    # Extrude a base face upward.
+    #
+    # add_face derives its normal from winding order, so a base face can come
+    # out pointing -Z. pushpull then builds the solid *below* the requested
+    # position -- a box asked for at z=0 spanning z=-30..0, with nothing to
+    # indicate anything went wrong.
+    def extrude_up(face, distance)
+      face.reverse! if face.normal.z < 0
+      face.pushpull(distance)
+    end
+
     # Push a face into the solid it sits on.
     #
     # Which sign cuts inward depends on the face's winding order, which is not
@@ -2624,8 +2641,18 @@ module SU_MCP
         eval_scope = Module.new
         raw_result = nil
 
+        # Capture anything the code prints. puts inside eval_ruby went to
+        # SketchUp's Ruby Console and never came back over MCP, so the obvious
+        # debugging reflex printed into a void.
+        captured = StringIO.new
         runner = lambda do
-          raw_result = eval_scope.module_eval(code, "(mcp eval_ruby)", 1)
+          previous_stdout = $stdout
+          begin
+            $stdout = captured
+            raw_result = eval_scope.module_eval(code, "(mcp eval_ruby)", 1)
+          ensure
+            $stdout = previous_stdout
+          end
         end
 
         Timeout::timeout(timeout_s, Timeout::Error) do
@@ -2664,6 +2691,7 @@ module SU_MCP
             # serialised as a whole, so callers get a typed result rather than
             # JSON they have to parse a second time.
             value:   value_ok ? raw_result : nil,
+            stdout:  (captured.string[0, 10_000] rescue nil),
             inspect: (raw_result.inspect[0, 10_000] rescue raw_result.to_s[0, 10_000]),
             class:   raw_result.class.name
           }
@@ -2672,9 +2700,18 @@ module SU_MCP
         warn "eval_ruby timed out after #{timeout_s}s"
         raise "Ruby evaluation timed out after #{timeout_s}s (hint: pass {\"timeout\": N} to increase)"
       rescue StandardError => e
-        error "eval_ruby error: #{e.message}"
+        error "eval_ruby error: #{e.class}: #{e.message}"
         debug e.backtrace.first(10).join("\n")
-        raise "Ruby evaluation error: #{e.message}"
+
+        # Keep the class and the line number. Flattening everything to
+        # "divided by 0" leaves no way to locate the fault in a 40-line script
+        # except by bisecting it. Frames from the submitted code are tagged
+        # "(mcp eval_ruby)" by module_eval, so they can be picked out from the
+        # extension's own frames.
+        user_frames = (e.backtrace || []).select { |f| f.include?("(mcp eval_ruby)") }
+        location = user_frames.first ? " at #{user_frames.first.sub('(mcp eval_ruby):', 'line ')}" : ""
+
+        raise "#{e.class}: #{e.message}#{location}"
       end
     end
   end
