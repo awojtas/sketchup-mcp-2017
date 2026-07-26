@@ -687,23 +687,92 @@ module SU_MCP
       [u, v]
     end
 
+    # Is this container a glue-to component?
+    #
+    # Glue-to components are MEANT to lie exactly on the face they are stuck
+    # to -- that is the entire mechanism, and a cutting one also punches the
+    # opening through it. SketchUp enforces it: move one off its plane and the
+    # next validity check snaps it back, reporting "Glued CGroup not on or
+    # parallel to glue plane". So a glue-to component flush against its host
+    # is correct modelling, and reporting it as a coplanar fault is wrong --
+    # worse, acting on that report breaks a working window or door.
+    def glue_to_container?(entity)
+      definition = (entity.definition rescue nil)
+      return false unless definition
+      behavior = (definition.behavior rescue nil)
+      return false unless behavior
+      (behavior.is2d? rescue false) ? true : false
+    end
+
+    # A glue-to component is constrained to the plane of the face it is stuck
+    # to, and its own local Z is that plane's normal -- verified against two
+    # glued windows and a door, whose local Z matched their host wall normal
+    # exactly. Move one off that plane and SketchUp's validity check reports
+    # "Glued CGroup not on or parallel to glue plane" and snaps it back. The
+    # move applies, measures as applied, and then quietly disappears at the
+    # next check: the worst failure shape this project has.
+    #
+    # So verify after the fact and roll back, rather than let a caller believe
+    # a move landed. Refused rather than forbidden -- pass unglue to do it
+    # anyway. Note that permission does not make it stick; SketchUp still
+    # enforces the constraint. Only clearing the component's glue behaviour
+    # does, which affects every instance sharing the definition.
+    GLUE_PLANE_TOLERANCE = 1e-6   # inches
+
+    # How far `after` has left the glue plane that `before` sat on, and whether
+    # it has been tilted out of parallel with it. Either breaks the glue.
+    def glue_plane_violation(before, after)
+      normal = before.zaxis
+      return nil if normal.length == 0
+      normal.normalize!
+
+      shifted = (after.origin - before.origin) % normal
+      now = after.zaxis
+      tilted = if now.length == 0
+                 false
+               else
+                 now.normalize!
+                 (1.0 - (now % normal).abs) > 1e-9
+               end
+
+      return nil if shifted.abs <= GLUE_PLANE_TOLERANCE && !tilted
+      { :shifted_cm => (shifted * 2.54), :tilted => tilted }
+    end
+
+    def glue_refusal_message(entity, violation, what)
+      detail = if violation[:tilted]
+                 "tilts it out of parallel with that plane"
+               else
+                 "moves it #{violation[:shifted_cm].abs.round(4)} cm off that plane"
+               end
+      "Entity #{entity.entityID} is a glue-to component, stuck to the face it " \
+      "sits on, and #{what} #{detail}. SketchUp's validity check will report " \
+      "\"not on or parallel to glue plane\" and snap it back, so this would " \
+      "look like it worked and then vanish on the next check. Move it within " \
+      "the plane instead, or pass unglue true to do it anyway."
+    end
+
     # Every face in the model with its world transform and container path.
+    # `glued` marks faces sitting anywhere inside a glue-to component.
     def each_world_face(model)
       found = []
-      walk = lambda do |entities, transform, path|
+      walk = lambda do |entities, transform, path, glued|
         entities.each do |e|
           if e.is_a?(Sketchup::Face)
-            found << { :face => e, :transform => transform, :path => path }
+            found << { :face => e, :transform => transform, :path => path,
+                       :glued => glued }
           elsif e.is_a?(Sketchup::Group)
             label = e.name.to_s.empty? ? "Group##{e.entityID}" : "#{e.name}##{e.entityID}"
-            walk.call(e.entities, transform * e.transformation, path + [label])
+            walk.call(e.entities, transform * e.transformation, path + [label],
+                      glued || glue_to_container?(e))
           elsif e.is_a?(Sketchup::ComponentInstance)
             label = e.definition.name.to_s.empty? ? "Instance##{e.entityID}" : "#{e.definition.name}##{e.entityID}"
-            walk.call(e.definition.entities, transform * e.transformation, path + [label])
+            walk.call(e.definition.entities, transform * e.transformation, path + [label],
+                      glued || glue_to_container?(e))
           end
         end
       end
-      walk.call(model.entities, Geom::Transformation.new, [])
+      walk.call(model.entities, Geom::Transformation.new, [], false)
       found
     end
 
@@ -778,6 +847,7 @@ module SU_MCP
       end
 
       overlaps = []
+      by_design = 0
       buckets.each_value do |group|
         next if group.length < 2
         group.each_with_index do |a, i|
@@ -786,12 +856,20 @@ module SU_MCP
             # Same container and sharing edges is normal; SketchUp would have
             # merged a genuine duplicate there, so only real area counts.
             next unless faces_share_area?(a, b, a[:normal])
+            # Exactly one side inside a glue-to component is that component
+            # sitting on its host face, which is how glue-to works. Two glued
+            # components overlapping EACH OTHER is still a fault, so only the
+            # mixed case is excused.
+            if a[:glued] != b[:glued]
+              by_design += 1
+              next
+            end
             overlaps << {
               a: { id: a[:face].entityID, container: a[:path],
-                   area_cm2: a[:area].round(2),
+                   area_cm2: a[:area].round(2), glued: a[:glued],
                    material: (a[:face].material ? a[:face].material.name : nil) },
               b: { id: b[:face].entityID, container: b[:path],
-                   area_cm2: b[:area].round(2),
+                   area_cm2: b[:area].round(2), glued: b[:glued],
                    material: (b[:face].material ? b[:face].material.name : nil) },
               plane_cm: point_to_cm(a[:point]),
               normal: [a[:normal].x.round(3), a[:normal].y.round(3), a[:normal].z.round(3)]
@@ -827,12 +905,23 @@ module SU_MCP
           coplanar_overlaps: {
             count: overlaps.length,
             shown: [overlaps.length, limit].min,
+            by_design_ignored: by_design,
             note: "Two faces on the same plane covering the same area. The " \
                   "depth buffer has no way to order them, so the surface " \
                   "flickers between them as the camera moves. Usually one is " \
                   "loose geometry drawn on top of a face inside a group. Fix " \
                   "by deleting whichever is redundant, or by moving the " \
-                  "stray face into the group so SketchUp can merge it.",
+                  "stray face into the group so SketchUp can merge it. Do NOT " \
+                  "nudge one off the plane: that leaves two surfaces with a " \
+                  "gap between them, which still measures and exports wrongly.",
+            by_design_note: "by_design_ignored counts pairs where exactly one " \
+                  "face sits inside a glue-to component -- a window or door " \
+                  "stuck to a wall. Those are MEANT to be coplanar with the " \
+                  "face they are glued to, and SketchUp snaps them back if " \
+                  "you move them, so they are not faults. A reported pair " \
+                  "carries glued on each side; where that is true, move the " \
+                  "component within its plane or delete it, never merge it " \
+                  "into its host.",
             pairs: overlaps[0, limit]
           },
           open_shells: {
@@ -861,7 +950,7 @@ module SU_MCP
       model = Sketchup.active_model
       raise "No active model" unless model
 
-      reject_unknown_params!(params, %w[id count offset], "array_copy")
+      reject_unknown_params!(params, %w[id count offset unglue], "array_copy")
       source = resolve_solid(model, params["id"], "source")
 
       count = (params["count"] || 0).to_i
@@ -881,6 +970,16 @@ module SU_MCP
 
       before = solid_stats(source)
       source_transform = source.transformation
+
+      # Every copy is stepped by the same vector, so if the step leaves the
+      # glue plane then all of them do. Checked before anything is created.
+      if glue_to_container?(source) && !params["unglue"]
+        stepped = Geom::Transformation.translation(
+          Geom::Vector3d.new(step_cm[0] / 2.54, step_cm[1] / 2.54, step_cm[2] / 2.54)) *
+          source_transform
+        violation = glue_plane_violation(source_transform, stepped)
+        raise glue_refusal_message(source, violation, "this offset") if violation
+      end
 
       committed = false
       copies = []
@@ -1278,7 +1377,10 @@ module SU_MCP
           raise "Pass either position (absolute) or translate (relative), not both"
         end
 
-        before_origin = entity.respond_to?(:transformation) ? entity.transformation.origin : nil
+        before_transform = entity.respond_to?(:transformation) ? entity.transformation : nil
+        before_origin = before_transform ? before_transform.origin : nil
+        # Checked after every step below, so rotation and scale are covered too.
+        guard_glue = before_transform && glue_to_container?(entity) && !params["unglue"]
 
         if params["translate"]
           delta = params["translate"]
@@ -1337,6 +1439,15 @@ module SU_MCP
           entity.transform!(scaling)
         end
         
+        if guard_glue
+          violation = glue_plane_violation(before_transform, entity.transformation)
+          if violation
+            # Restore exactly, so a refusal leaves nothing half-applied.
+            entity.transformation = before_transform
+            raise glue_refusal_message(entity, violation, "this transform")
+          end
+        end
+
         { success: true, id: entity.entityID }
       else
         raise "Entity not found"
