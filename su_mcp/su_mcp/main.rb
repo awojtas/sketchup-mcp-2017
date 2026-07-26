@@ -515,6 +515,8 @@ module SU_MCP
           create_dovetail(args)
         when "create_finger_joint"
           create_finger_joint(args)
+        when "create_text"
+          create_text(args)
         when "eval_ruby"
           eval_ruby(args)
         when "batch"
@@ -2148,6 +2150,152 @@ module SU_MCP
                    thickness]
         end
         cuts
+      end
+    end
+
+    # ──────────────────────────────────────────────────────────────────
+    # 3D text
+    # ──────────────────────────────────────────────────────────────────
+    #
+    # Raised lettering -- house numbers, signage, labels. SketchUp builds the
+    # glyph outlines itself via add_3d_text, so this is real letterforms with
+    # curves and counters, not something assembled from points.
+    #
+    # Two things make it worth a tool rather than raw eval_ruby:
+    #
+    # 1. add_3d_text returns true/false, NOT the geometry it created. Call it
+    #    on active_entities and the result is loose in the model with nothing
+    #    identifying it. It has to be given its own group first.
+    # 2. Standing text up on a wall means building an axes transform. Get the
+    #    handedness wrong and the text comes out MIRRORED -- and a mirrored
+    #    glyph has identical bounds, volume and face count to a correct one,
+    #    so nothing but looking at it will tell you. The reading direction is
+    #    derived here rather than left to the caller.
+
+    # Outward direction the lettering faces, i.e. the side you read it from.
+    TEXT_FACINGS = {
+      "+x" => [1.0, 0.0, 0.0], "-x" => [-1.0, 0.0, 0.0],
+      "+y" => [0.0, 1.0, 0.0], "-y" => [0.0, -1.0, 0.0],
+      "+z" => [0.0, 0.0, 1.0], "-z" => [0.0, 0.0, -1.0]
+    }.freeze
+
+    def create_text(params)
+      model = Sketchup.active_model
+      raise "No active model" unless model
+
+      reject_unknown_params!(params, %w[text position facing height depth
+                                        font bold italic name], "create_text")
+
+      text = params["text"].to_s
+      raise "text must not be empty" if text.strip.empty?
+
+      key = (params["facing"] || "+z").to_s.downcase.strip
+      key = "+" + key unless key =~ /\A[-+]/
+      normal = TEXT_FACINGS[key]
+      unless normal
+        raise "facing must be one of #{TEXT_FACINGS.keys.join(', ')} -- the " \
+              "direction the lettering faces, which is the side you read it from"
+      end
+
+      height_cm = (params["height"] || 5.0).to_f
+      raise "height must be greater than 0" unless height_cm > 0
+      depth_cm = (params["depth"] || 0.3).to_f
+      raise "depth must be greater than 0" unless depth_cm > 0
+
+      position = params["position"] || [0.0, 0.0, 0.0]
+      unless position.is_a?(Array) && position.length == 3
+        raise "position must be [x, y, z] in cm -- where the lettering is " \
+              "centred on the surface it sits on"
+      end
+
+      font   = (params["font"] || "Arial").to_s
+      bold   = params["bold"] ? true : false
+      italic = params["italic"] ? true : false
+
+      # Reading direction from the facing, so the caller cannot produce
+      # mirrored text: with up fixed, right = up x facing is the only
+      # right-handed choice.
+      facing = Geom::Vector3d.new(normal[0], normal[1], normal[2])
+      up = if normal[2].abs > 0.5
+             Geom::Vector3d.new(0, 1, 0)   # lettering laid flat
+           else
+             Geom::Vector3d.new(0, 0, 1)   # lettering standing on a wall
+           end
+      right = up.cross(facing)
+
+      committed = false
+      group = nil
+      begin
+        model.start_operation("MCP create_text", true)
+        group = model.active_entities.add_group
+        group.name = (params["name"] || "text #{text}").to_s
+
+        built = group.entities.add_3d_text(
+          text, TextAlignLeft, font, bold, italic,
+          height_cm / 2.54, 0.0, 0.0, true, depth_cm / 2.54)
+
+        unless built && group.entities.grep(Sketchup::Face).length > 0
+          raise "SketchUp could not build 3D text for #{text.inspect} in font " \
+                "#{font.inspect}. The font may not be installed -- try Arial."
+        end
+
+        # add_3d_text lays the glyphs in the XY plane extruded along +Z. Move
+        # that frame onto the surface: reading along `right`, up along `up`,
+        # and growing outward along `facing`, with the glyphs centred on the
+        # requested point and their backs on the surface.
+        b = group.bounds
+        cx = (b.min.x + b.max.x) / 2.0
+        cy = (b.min.y + b.max.y) / 2.0
+        px = position[0].to_f / 2.54
+        py = position[1].to_f / 2.54
+        pz = position[2].to_f / 2.54
+
+        origin = Geom::Point3d.new(px - cx * right.x - cy * up.x,
+                                   py - cx * right.y - cy * up.y,
+                                   pz - cx * right.z - cy * up.z)
+        group.transformation = Geom::Transformation.axes(origin, right, up, facing)
+
+        stats = solid_stats(group)
+
+        # The lettering must sit ON the surface and grow outward from it, not
+        # straddle it or sink in. Check along the facing axis, where the
+        # expected span is exactly [position, position + depth].
+        axis = normal.index { |v| v != 0.0 }
+        sign = normal[axis]
+        near_face = stats[:bounds_cm][:min][axis]
+        far_face  = stats[:bounds_cm][:max][axis]
+        lo = sign > 0 ? position[axis].to_f : position[axis].to_f - depth_cm
+        hi = sign > 0 ? position[axis].to_f + depth_cm : position[axis].to_f
+        if (near_face - lo).abs > 0.01 || (far_face - hi).abs > 0.01
+          raise "The lettering did not land on the surface: it spans " \
+                "#{near_face.round(2)}..#{far_face.round(2)} cm on " \
+                "#{AXIS_NAMES[axis]} where #{lo.round(2)}..#{hi.round(2)} was " \
+                "expected. The model was left unchanged."
+        end
+
+        model.commit_operation
+        committed = true
+
+        {
+          success: true,
+          result: {
+            id: group.entityID,
+            name: group.name,
+            text: text,
+            facing: key,
+            height_cm: height_cm,
+            depth_cm: depth_cm,
+            font: font,
+            solid: stats[:manifold],
+            volume_cm3: stats[:volume_cm3],
+            faces: stats[:faces],
+            bounds_cm: stats[:bounds_cm]
+          }
+        }
+      ensure
+        if !committed && model.respond_to?(:abort_operation)
+          model.abort_operation rescue nil
+        end
       end
     end
     

@@ -1,4 +1,4 @@
-from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.fastmcp import FastMCP, Context, Image
 import socket
 import json
 import os
@@ -614,6 +614,61 @@ def create_dovetail(
     return _call(ctx, "create_dovetail", args)
 
 @mcp.tool()
+def create_text(
+    ctx: Context,
+    text: str,
+    position: List[float],
+    facing: str = "+z",
+    height: float = 5.0,
+    depth: float = 0.3,
+    font: str = "Arial",
+    bold: bool = False,
+    italic: bool = False,
+    name: Optional[str] = None,
+) -> str:
+    """Create raised 3D lettering -- house numbers, signage, labels.
+
+    SketchUp builds the glyph outlines, so these are real letterforms with
+    curves and counters, not shapes approximated from points. Use this rather
+    than cut_pocket for anything textual: a letter is not a prismatic profile
+    you can write out as coordinates.
+
+    Args:
+        text:     the string to build.
+        position: [x, y, z] in CENTIMETRES -- where the lettering is CENTRED
+                  on the surface it sits on. It grows outward from there.
+        facing:   "+x", "-x", "+y", "-y", "+z" or "-z" -- the direction the
+                  lettering faces, meaning the side you read it from. To put
+                  a number on a wall whose outer surface faces -x, pass "-x"
+                  and a position on that wall.
+        height:   cap height in centimetres.
+        depth:    how far it stands proud of the surface, in centimetres.
+        font:     font name. Falls back with an error if not installed.
+        bold, italic: font styling.
+        name:     name for the resulting group.
+
+    Returns the new group's id, bounds, volume and face count. The lettering
+    is a separate solid group sitting on the surface -- "stuck on" rather than
+    carved in. Engraving instead needs solid_op, which requires Pro.
+
+    The reading direction is derived from `facing`, so the text cannot come
+    out mirrored. That matters because a mirrored glyph has identical bounds,
+    volume and face count to a correct one -- only looking at it, or trusting
+    this, will tell you.
+
+    Works without SketchUp Pro.
+    """
+    args: Dict[str, Any] = {
+        "text": text, "position": position, "facing": facing,
+        "height": height, "depth": depth, "font": font,
+        "bold": bold, "italic": italic,
+    }
+    if name is not None:
+        args["name"] = name
+    return _call(ctx, "create_text", args)
+
+
+@mcp.tool()
 def eval_ruby(
     ctx: Context,
     code: str
@@ -752,16 +807,23 @@ def measure(ctx: Context, id: int) -> str:
 def snapshot(ctx: Context, width: int = 1600, height: int = 1000,
              camera: Optional[Dict[str, Any]] = None,
              antialias: bool = True, path: Optional[str] = None,
-             compression: float = 0.9) -> str:
-    """Render the active view to a PNG.
+             compression: float = 0.9, as_image: bool = True):
+    """Render the active view and return the image.
+
+    Look at the result. Geometry that is wrong -- mirrored, inside out, built
+    downward, in the wrong place -- routinely returns numbers that look right,
+    and rendering is the cheapest way to catch it.
 
     Args:
-        width, height: Output pixel dimensions.
+        width, height: Output pixel dimensions. Smaller is cheaper to send;
+                       around 1000x700 is plenty to inspect a model.
         camera: Optional {eye: [x,y,z], target: [x,y,z], up: [x,y,z],
-                          perspective: bool, fov: float}.
+                          perspective: bool, fov: float}. Lengths in CM.
         antialias: Enable 2x AA.
         path: Destination path (default: temp file).
         compression: PNG compression 0..1.
+        as_image: Return the render itself, plus JSON metadata. Set false for
+                  just the path -- useful when writing a file for a human.
     """
     args: Dict[str, Any] = {
         "width": width, "height": height,
@@ -771,7 +833,22 @@ def snapshot(ctx: Context, width: int = 1600, height: int = 1000,
         args["camera"] = camera
     if path is not None:
         args["path"] = path
-    return _call(ctx, "snapshot", args, timeout=LONG_TIMEOUT)
+    result = _call(ctx, "snapshot", args, timeout=LONG_TIMEOUT)
+
+    if not as_image:
+        return result
+
+    # Returning the render itself, not just where it was written. Modelling is
+    # verified by looking, and a path costs the caller an extra read -- or,
+    # worse, gets taken on trust. The JSON still rides along as a text block,
+    # so anything parsing the path keeps working.
+    try:
+        rendered = json.loads(result).get("result", {}).get("path")
+        if rendered and os.path.isfile(rendered):
+            return [Image(path=rendered), result]
+    except (ValueError, TypeError, OSError) as e:
+        logger.warning(f"snapshot: returning path only, could not attach image: {e}")
+    return result
 
 
 @mcp.tool()
