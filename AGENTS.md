@@ -81,6 +81,17 @@ The edit applies, `measure` confirms it, a snapshot looks right, and then it dis
 
 The general lesson: **never fix a coplanar overlap by nudging one face off the plane.** That trades a visible rendering artifact for two surfaces with an invisible gap, which still measures and exports wrongly. Merge the contexts, or delete the redundant face.
 
+### Raw Ruby traps that return a plausible wrong answer
+
+Full detail and evidence in `docs/sketchup-make-2017.md`. The ones that cost the most time:
+
+- **`pushpull` follows the face normal**, so cutting into a solid is always a *negative* distance. Positive on a downward-facing face extrudes a boss instead of boring a hole, and it looks right until you check the bounds.
+- **`BoundingBox#height` is Y and `#depth` is Z.** Only `#width` means what it says.
+- **`add_face` returns `nil`** when the loop you drew merely splits an existing face. Locate the resulting face with `classify_point` rather than treating `nil` as failure.
+- **`DefinitionList#remove` does not exist on 2017**, and `purge_unused` takes every unused definition with it.
+- **Setting `pages.selected_page` animates**, so a snapshot taken in the same breath renders the previous scene while the layer state already reads as the new one. Disable `PageOptions ShowTransition` first.
+- **Scenes store no geometry positions** — camera, layers, style, section planes and shadows only. Exploded views need duplicated geometry that then goes stale; say so before offering one.
+
 ## Agent Guidelines
 
 ### Token efficiency
