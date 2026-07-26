@@ -1,4 +1,6 @@
-# SketchupMCP 2017 - Sketchup Model Context Protocol Integration
+# SketchupMCP 2017 — SketchUp Model Context Protocol integration
+
+Control SketchUp from Claude: create and modify geometry, inspect the model, apply materials, cut joinery, or run Ruby directly.
 
 > **A fork of [mhyrr/sketchup-mcp](https://github.com/mhyrr/sketchup-mcp)** that adds:
 >
@@ -6,12 +8,8 @@
 > - **A fix for the freeze** — upstream locks SketchUp up whenever an agent connects
 > - **SketchUp Make 2017 support** — tested against the last free desktop version
 >
-> Credit for the original work to [@mhyrr](https://github.com/mhyrr).
+> Credit for the original work to [@mhyrr](https://github.com/mhyrr), and to [Blender MCP](https://github.com/ahujasid/blender-mcp) for the structure.
 > Detail on the fixes: [what this fork changes](docs/fork-changes.md).
-
-SketchupMCP connects Sketchup to Claude AI through the Model Context Protocol (MCP), allowing Claude to directly interact with and control Sketchup. This integration enables prompt-assisted 3D modeling, scene creation, and manipulation in Sketchup.
-
-Big Shoutout to [Blender MCP](https://github.com/ahujasid/blender-mcp) for the inspiration and structure.
 
 ## SketchUp Make 2017
 
@@ -27,18 +25,9 @@ Releases are unsigned. If your Extension Manager refuses to load one, set its lo
 
 Full breakdown: [`docs/sketchup-make-2017.md`](docs/sketchup-make-2017.md).
 
-## Features
-
-* **Two-way communication**: Connect Claude AI to Sketchup through a TCP socket connection
-* **Component manipulation**: Create, modify, delete, and transform components in Sketchup
-* **Material control**: Apply and modify materials and colors
-* **Scene inspection**: Get detailed information about the current Sketchup scene
-* **Selection handling**: Get and manipulate selected components
-* **Ruby code evaluation**: Execute arbitrary Ruby code directly in SketchUp for advanced operations
-
 ## How it fits together
 
-There are two separate pieces, and they have a **server / client** relationship. Getting this straight makes the setup and the troubleshooting much easier.
+There are two pieces, in a **server / client** relationship. Getting this straight makes setup and troubleshooting much easier.
 
 ```
    Claude Code                sketchup-mcp                 SketchUp
@@ -52,23 +41,11 @@ There are two separate pieces, and they have a **server / client** relationship.
                               by the agent                 the SketchUp menu
 ```
 
-### The server — the SketchUp extension
+**The server** is the `.rbz` you install into SketchUp. It listens on `127.0.0.1:9876` and runs commands against the open model. **You start it manually, every session**: `Extensions > MCP Server > Start Server`. Nothing starts it for you, and installing the extension isn't enough. Skip it and everything else looks correctly configured but still won't work.
 
-The `.rbz` you install into SketchUp. It opens a TCP socket on `127.0.0.1:9876` and waits for commands, which it executes against the open model.
+**The client** is the `sketchup-mcp` Python package. Confusingly it's usually called "the MCP server", because it *is* one — to Claude. But to SketchUp it's the client. Your agent launches it automatically once registered.
 
-**You start it manually, every SketchUp session**: `Extensions > MCP Server > Start Server`. Nothing starts it for you, and it does not run just because the extension is installed. If you skip this step, everything else will look correctly configured and still not work.
-
-### The client — the `sketchup-mcp` Python package
-
-Confusingly, this is the thing usually called "the MCP server", because it *is* an MCP server — to Claude. But in its relationship with SketchUp it is the **client**: it opens the connection to port 9876 and sends commands.
-
-**Your coding agent starts this automatically** once it's registered (see below) — you don't launch it by hand for normal use. You *can* run it manually, which is useful for testing, because you get its log directly in the terminal:
-
-```bash
-uvx --from git+https://github.com/awojtas/sketchup-mcp-2017 sketchup-mcp
-```
-
-Run that way it prints its startup log and then waits on stdin. `Connected to SketchUp at localhost:9876` means the extension is running and reachable; `Could not connect` means you haven't started the server in SketchUp. Ctrl+C when done — the agent needs to launch its own copy.
+Both ends use loopback, so **Claude and SketchUp must be on the same machine**. That's deliberate: `eval_ruby` executes arbitrary Ruby inside SketchUp, so binding wider would expose remote code execution to your network. Running them apart needs an SSH tunnel forwarding port 9876.
 
 ## Installation
 
@@ -77,56 +54,24 @@ Run that way it prints its startup log and then waits on stdin. `Connected to Sk
 The client is launched with [uv](https://docs.astral.sh/uv/). Install it first — if it's missing, Claude reports the MCP server as `failed` with error `-32000`, which looks like a bug in this project rather than a missing command.
 
 ```powershell
-winget install --id=astral-sh.uv -e          # Windows
+winget install --id=astral-sh.uv -e                # Windows
 ```
 ```bash
-brew install uv                               # macOS
-curl -LsSf https://astral.sh/uv/install.sh | sh   # Linux
+brew install uv                                    # macOS
+curl -LsSf https://astral.sh/uv/install.sh | sh    # Linux
 ```
 
 Open a new terminal afterwards so `uv` is on `PATH`, and check with `uv --version`.
 
-Prefer not to use uv? A plain pip install works too, as long as it's from git rather than PyPI — see the warning below:
+### Install the extension
 
-```bash
-pip install git+https://github.com/awojtas/sketchup-mcp-2017
-claude mcp add sketchup -- sketchup-mcp
-```
+1. Download the latest `.rbz` from [Releases](https://github.com/awojtas/sketchup-mcp-2017/releases)
+2. In SketchUp: Window > Extension Manager > Install Extension, and select the `.rbz`
+3. Restart SketchUp
 
-### Install the server (the SketchUp extension)
+On 2017 the Extension Manager may refuse an unsigned extension. If so, open Extension Manager > Settings (gear icon), set the loading policy to **Unrestricted**, and restart.
 
-1. Download the latest `.rbz` from [Releases](https://github.com/awojtas/sketchup-mcp-2017/releases) (or build it yourself with `cd su_mcp && ruby package.rb`)
-2. In Sketchup, go to Window > Extension Manager
-3. Click "Install Extension" and select the downloaded `.rbz` file
-4. Restart Sketchup
-
-On SketchUp 2017 the Extension Manager may refuse to load an unsigned extension. If it does, open Extension Manager > Settings (gear icon) and set the loading policy to **Unrestricted**, then restart.
-
-## Usage
-
-### Both halves must run on the same machine
-
-Both ends use loopback, so **Claude and SketchUp have to be on the same computer**. Running them on different machines needs an SSH tunnel forwarding port 9876.
-
-That's deliberate — `eval_ruby` executes arbitrary Ruby inside SketchUp, so binding wider would expose remote code execution to your network.
-
-### Step 1 — start the server (in SketchUp, every session)
-
-1. In SketchUp, go to **Extensions > MCP Server > Start Server**.
-2. The Ruby Console appears and logs `Starting server ... on localhost:9876` followed by `Server listening on port 9876`. That console line is the confirmation — the menu gives no other feedback.
-
-This has to be done again each time you restart SketchUp.
-
-To double-check the listener is actually up:
-
-```bash
-# Windows
-netstat -ano | findstr 9876
-# macOS / Linux
-lsof -nP -iTCP:9876 -sTCP:LISTEN
-```
-
-### Step 2 — register the client with your agent (once)
+### Register the client
 
 #### Claude Code
 
@@ -135,17 +80,16 @@ uv tool install git+https://github.com/awojtas/sketchup-mcp-2017
 claude mcp add sketchup -- sketchup-mcp
 ```
 
-Install once, then start it directly. `uvx --from git+...` also works, but it
-re-resolves and re-fetches from git on **every** start — measurably slower, and
-on Windows it can take long enough that Claude times out waiting. To update
-later: `uv tool upgrade sketchup-mcp`, or re-run the install with `--force`.
+Then `/mcp` inside Claude Code to confirm. This is a one-off — from then on Claude Code launches the client itself.
 
-If startup still times out, raise Claude Code's limit with `MCP_TIMEOUT`
-(milliseconds), e.g. `MCP_TIMEOUT=60000`.
+Install once and start it directly, as above. `uvx --from git+...` also works but re-resolves and re-fetches from git on **every** start — measurably slower, and on Windows slow enough that Claude may time out. Raise the limit with `MCP_TIMEOUT` (milliseconds) if needed. To update later: `uv tool upgrade sketchup-mcp`.
 
-Then `/mcp` inside Claude Code to confirm. This is a one-off — from then on Claude Code launches the client itself whenever it needs it.
+Prefer pip? Fine, as long as it's from git rather than PyPI:
 
-Note that the client will report as **connected even with SketchUp closed**: it only warns at startup and fails at tool-call time. A connected client is not proof the server is running.
+```bash
+pip install git+https://github.com/awojtas/sketchup-mcp-2017
+claude mcp add sketchup -- sketchup-mcp
+```
 
 #### Claude Desktop
 
@@ -161,91 +105,83 @@ Note that the client will report as **connected even with SketchUp closed**: it 
 ```
 
 > **Don't use `uvx sketchup-mcp`.** Upstream's README recommends it, but the
-> [PyPI package](https://pypi.org/project/sketchup-mcp/) is stale: 0.1.17 was published
-> before upstream's own `instructions=`/`description=` FastMCP fix, so it raises a
-> `TypeError` on startup against current versions of the `mcp` package. Installing from
-> git, as above, avoids this. This fork does not publish to PyPI — upstream owns that name.
+> [PyPI package](https://pypi.org/project/sketchup-mcp/) is stale: `0.1.17` predates
+> upstream's own FastMCP fix, so it raises a `TypeError` against current versions of the
+> `mcp` package. Install from git instead. This fork doesn't publish to PyPI — upstream
+> owns that name.
 
-Once connected, Claude can interact with Sketchup using the following capabilities:
+## Usage
 
-#### Tools
+Start the server in SketchUp (`Extensions > MCP Server > Start Server`) each session. The Ruby Console logs `Server listening on port 9876` — that line is the only confirmation the menu gives.
 
-**Modelling** — `create_component`, `delete_component`, `transform_component`, `set_material`, `select`, `undo_last`
+Then just ask:
 
-**Inspection** — `get_selection`, `measure`, `list_definitions`, `list_instances`, `units_info`, `snapshot`
+* "Create a simple house model with a roof and windows"
+* "Make the selected component red"
+* "Cut a dovetail joint between these two boards"
+* "Move the selected component 10 cm up"
+* "Create a complex arts and crafts cabinet using Ruby code"
+
+Lengths at the tool boundary are **centimetres**. Raw Ruby in `eval_ruby` returns SketchUp's internal inches.
+
+### Tools
+
+**Modelling** — `create_component`, `delete_component`, `transform_component`, `cut_pocket`, `solid_op`, `set_material`, `select`, `undo_last`
 
 **Joinery** — `create_dovetail`, `create_finger_joint`, `create_mortise_tenon`
 
+**Inspection** — `get_selection`, `measure`, `list_definitions`, `list_instances`, `units_info`, `snapshot`
+
 **Other** — `export_scene`, `eval_ruby` (arbitrary Ruby in SketchUp), `batch` (several calls in one undo step), `transaction`, `ping`
-
-### Example Commands
-
-Here are some examples of what you can ask Claude to do:
-
-* "Create a simple house model with a roof and windows"
-* "Select all components and get their information"
-* "Make the selected component red"
-* "Move the selected component 10 units up"
-* "Export the current scene as a 3D model"
-* "Create a complex arts and crafts cabinet using Ruby code"
 
 ## Troubleshooting
 
-**Claude shows the MCP server as `failed`.** Usually `uv` isn't installed, or isn't on `PATH` in the terminal Claude inherited. Install it, restart Claude. To see the real error, run the client by hand:
+**Claude shows the MCP server as `failed`.** Usually `uv` isn't installed, or isn't on `PATH` in the terminal Claude inherited. Install it and restart Claude. To see the real error, run the client by hand — it prints its startup log and waits on stdin:
 
 ```bash
 uvx --from git+https://github.com/awojtas/sketchup-mcp-2017 sketchup-mcp
 ```
 
-**Claude connects, but tool calls fail.** The client connects whether or not SketchUp is listening, so a connected client proves nothing about the server. Check SketchUp is open and you've run **Extensions > MCP Server > Start Server** *this session* — it doesn't auto-start, including after a SketchUp restart.
+`Connected to SketchUp at localhost:9876` means the extension is reachable; `Could not connect` means you haven't started the server.
 
-**Extension Manager still shows the old version after installing a new `.rbz`.** Expected on SketchUp Make 2017: the version isn't refreshed by reopening Extension Manager. Close SketchUp entirely and reopen it, and the correct version appears. The update did install.
+**Claude connects, but tool calls fail.** The client connects whether or not SketchUp is listening, so **a connected client proves nothing about the server**. Check SketchUp is open and that you started the server *this session* — it doesn't auto-start, including after a SketchUp restart.
 
-**Not sure the server is listening?**
+**Is the listener actually up?**
 
 ```bash
 netstat -ano | findstr 9876          # Windows
 lsof -nP -iTCP:9876 -sTCP:LISTEN     # macOS / Linux
 ```
 
-**Command failures.** The Ruby Console carries the server-side error. For more, set `SKETCHUP_MCP_LOG_LEVEL=DEBUG` and `SKETCHUP_MCP_VERBOSE_CONSOLE=1`.
+**Extension Manager still shows the old version after installing a new `.rbz`.** Expected on Make 2017 — the version isn't refreshed by reopening Extension Manager. Close SketchUp entirely and reopen. The update did install.
+
+**Command failures.** The Ruby Console carries the server-side error, and the extension mirrors its log to `%TEMP%\sketchup_mcp.log` (the console has no read-back API). For more, set `SKETCHUP_MCP_LOG_LEVEL=DEBUG` and `SKETCHUP_MCP_VERBOSE_CONSOLE=1`.
 
 **Timeouts.** `eval_ruby` is capped at 30s by default — raise `SKETCHUP_MCP_EVAL_TIMEOUT`, or break the work into smaller calls.
 
-## Technical Details
-
-### Communication Protocol
-
-The system uses a simple JSON-based protocol over TCP sockets:
-
-* **Commands** are sent as JSON objects with a `type` and optional `params`
-* **Responses** are JSON objects with a `status` and `result` or `message`
-
 ## Building and releasing
 
-The extension package is built by a standard-library-only Python script — no Ruby, no `rubyzip`, nothing to install. (Upstream's `su_mcp/package.rb` still works if you have the gem, but needing it is why [mhyrr/sketchup-mcp#10](https://github.com/mhyrr/sketchup-mcp/issues/10) went unanswered for so long.)
+The extension is built by a standard-library-only Python script — no Ruby, no `rubyzip`.
 
 ```bash
-python3 scripts/build_rbz.py --version 1.6.0   # -> dist/su_mcp_v1.6.0.rbz
+python3 scripts/build_rbz.py --version 2.9.0   # -> dist/su_mcp_v2.9.0.rbz
 python3 scripts/check_ruby22_compat.py         # fails on any post-Ruby-2.2 syntax
+ruby tests/test_socket_loop.rb                 # socket regression suite
 ```
 
 To cut a release, push a tag:
 
 ```bash
-git tag v1.6.0
-git push origin v1.6.0
+git tag v2.9.0 && git push origin v2.9.0
 ```
 
-CI checks Ruby 2.2 compatibility, runs the socket regression suite, builds the `.rbz`, and publishes a GitHub Release with the file attached. The tag is the only place a version is written — it's stamped into `extension.json`, the loader, and `main.rb`'s `VERSION` at build time, and the build fails if any of the three disagree.
+CI runs the checks, builds the `.rbz`, and publishes a GitHub Release with the file attached. The tag is the only place a version is written — it's stamped into `extension.json`, the loader, and `main.rb` at build time, and the build fails if they disagree.
 
-The *contents* of a build are deterministic: same source and version in, same files out, with fixed timestamps. The archive's compressed bytes are not — zlib's output varies between Python versions, so a `.rbz` built locally can differ in size from the one CI publishes while containing byte-identical files. Compare file contents, not the archive hash.
+Build *contents* are deterministic for a given source and version. The compressed archive bytes are not — zlib output varies between Python versions — so compare file contents, not archive hashes.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-Fixes that aren't specific to Make 2017 are better sent to [upstream](https://github.com/mhyrr/sketchup-mcp) so everyone benefits.
+Contributions welcome. Fixes that aren't specific to Make 2017 are better sent [upstream](https://github.com/mhyrr/sketchup-mcp) so everyone benefits.
 
 ## License
 

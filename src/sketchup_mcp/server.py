@@ -501,136 +501,117 @@ def export_scene(
         return f"Error exporting scene: {str(e)}"
 
 @mcp.tool()
+def create_finger_joint(
+    ctx: Context,
+    board1_id: str,
+    board2_id: str,
+    fingers: int = 5,
+    across: Optional[str] = None,
+) -> str:
+    """Cut a finger (box) joint between two boards.
+
+    Position the two boards FIRST so their ends overlap by the depth of the
+    joint -- that overlap is the joint, and everything else is derived from
+    it. The boards must meet end to end along one axis; one passing through
+    the other is rejected.
+
+    Args:
+        board1_id, board2_id: entityIDs of the two boards. board1 keeps the
+                    first finger, board2 the next, alternating.
+        fingers:    how many fingers across the joint (at least 2).
+        across:     "x", "y" or "z" -- the axis the fingers alternate along.
+                    Defaults to the wider of the two axes the boards do not
+                    meet along, which is the board's width in normal use.
+
+    Works without SketchUp Pro: every cut is a profile pushed into a face.
+
+    The two boards must together fill the overlap region exactly once, and
+    that is checked before anything is committed -- so a joint that would
+    leave a gap, cut the wrong board, or have the halves interpenetrate
+    fails and leaves the model untouched rather than looking plausible.
+    """
+    args = {"board1_id": board1_id, "board2_id": board2_id, "fingers": fingers}
+    if across is not None:
+        args["across"] = across
+    return _call(ctx, "create_finger_joint", args)
+
+
+@mcp.tool()
 def create_mortise_tenon(
     ctx: Context,
     mortise_id: str,
     tenon_id: str,
-    width: float = 1.0,
-    height: float = 1.0,
-    depth: float = 1.0,
-    offset_x: float = 0.0,
-    offset_y: float = 0.0,
-    offset_z: float = 0.0
+    width: Optional[float] = None,
+    height: Optional[float] = None,
+    across: Optional[str] = None,
 ) -> str:
-    """Create a mortise and tenon joint between two components"""
-    try:
-        logger.info(f"create_mortise_tenon called with mortise_id={mortise_id}, tenon_id={tenon_id}, width={width}, height={height}, depth={depth}, offsets=({offset_x}, {offset_y}, {offset_z})")
-        
-        sketchup = get_sketchup_connection()
-        
-        result = sketchup.send_command(
-            method="tools/call",
-            params={
-                "name": "create_mortise_tenon",
-                "arguments": {
-                    "mortise_id": mortise_id,
-                    "tenon_id": tenon_id,
-                    "width": width,
-                    "height": height,
-                    "depth": depth,
-                    "offset_x": offset_x,
-                    "offset_y": offset_y,
-                    "offset_z": offset_z
-                }
-            },
-            request_id=ctx.request_id
-        )
-        
-        logger.info(f"create_mortise_tenon result: {result}")
-        return json.dumps(result)
-    except Exception as e:
-        logger.error(f"Error in create_mortise_tenon: {str(e)}")
-        return f"Error creating mortise and tenon joint: {str(e)}"
+    """Cut a mortise and tenon joint between two boards.
+
+    Position the two boards FIRST so the tenon board's end overlaps the
+    mortise board by the depth of the joint.
+
+    Args:
+        mortise_id: entityID of the board that gets the socket.
+        tenon_id:   entityID of the board that keeps the stub. Its four
+                    shoulders are cut away to leave the tenon.
+        width:      tenon width in CENTIMETRES, across the joint's wider
+                    axis. Defaults to half the joint's extent.
+        height:     tenon thickness in CENTIMETRES. Defaults to a third of
+                    the joint's extent, the usual rule of thumb.
+        across:     "x", "y" or "z" -- which axis `width` is measured along.
+
+    Roles are bound to the ids you give, not to where the boards sit: the
+    socket goes into mortise_id whichever side of the joint it is on.
+
+    Works without SketchUp Pro. Verified before commit: the two boards must
+    together fill the overlap exactly once, or nothing is changed.
+    """
+    args = {"mortise_id": mortise_id, "tenon_id": tenon_id}
+    if width is not None:
+        args["width"] = width
+    if height is not None:
+        args["height"] = height
+    if across is not None:
+        args["across"] = across
+    return _call(ctx, "create_mortise_tenon", args)
+
 
 @mcp.tool()
 def create_dovetail(
     ctx: Context,
     tail_id: str,
     pin_id: str,
-    width: float = 1.0,
-    height: float = 1.0,
-    depth: float = 1.0,
-    angle: float = 15.0,
-    num_tails: int = 3,
-    offset_x: float = 0.0,
-    offset_y: float = 0.0,
-    offset_z: float = 0.0
+    tails: int = 2,
+    angle: float = 10.0,
+    across: Optional[str] = None,
 ) -> str:
-    """Create a dovetail joint between two components"""
-    try:
-        logger.info(f"create_dovetail called with tail_id={tail_id}, pin_id={pin_id}, width={width}, height={height}, depth={depth}, angle={angle}, num_tails={num_tails}")
-        
-        sketchup = get_sketchup_connection()
-        
-        result = sketchup.send_command(
-            method="tools/call",
-            params={
-                "name": "create_dovetail",
-                "arguments": {
-                    "tail_id": tail_id,
-                    "pin_id": pin_id,
-                    "width": width,
-                    "height": height,
-                    "depth": depth,
-                    "angle": angle,
-                    "num_tails": num_tails,
-                    "offset_x": offset_x,
-                    "offset_y": offset_y,
-                    "offset_z": offset_z
-                }
-            },
-            request_id=ctx.request_id
-        )
-        
-        logger.info(f"create_dovetail result: {result}")
-        return json.dumps(result)
-    except Exception as e:
-        logger.error(f"Error in create_dovetail: {str(e)}")
-        return f"Error creating dovetail joint: {str(e)}"
+    """Cut a through dovetail joint between two boards.
 
-@mcp.tool()
-def create_finger_joint(
-    ctx: Context,
-    board1_id: str,
-    board2_id: str,
-    width: float = 1.0,
-    height: float = 1.0,
-    depth: float = 1.0,
-    num_fingers: int = 5,
-    offset_x: float = 0.0,
-    offset_y: float = 0.0,
-    offset_z: float = 0.0
-) -> str:
-    """Create a finger joint (box joint) between two components"""
-    try:
-        logger.info(f"create_finger_joint called with board1_id={board1_id}, board2_id={board2_id}, width={width}, height={height}, depth={depth}, num_fingers={num_fingers}")
-        
-        sketchup = get_sketchup_connection()
-        
-        result = sketchup.send_command(
-            method="tools/call",
-            params={
-                "name": "create_finger_joint",
-                "arguments": {
-                    "board1_id": board1_id,
-                    "board2_id": board2_id,
-                    "width": width,
-                    "height": height,
-                    "depth": depth,
-                    "num_fingers": num_fingers,
-                    "offset_x": offset_x,
-                    "offset_y": offset_y,
-                    "offset_z": offset_z
-                }
-            },
-            request_id=ctx.request_id
-        )
-        
-        logger.info(f"create_finger_joint result: {result}")
-        return json.dumps(result)
-    except Exception as e:
-        logger.error(f"Error in create_finger_joint: {str(e)}")
-        return f"Error creating finger joint: {str(e)}"
+    Position the two boards FIRST so their ends overlap by the depth of the
+    joint -- for a through dovetail that overlap is the thickness of the
+    mating board.
+
+    Args:
+        tail_id:  entityID of the board that keeps the tails. They flare
+                  toward that board's own end, which is what stops the
+                  joint pulling apart.
+        pin_id:   entityID of the board that gets the matching sockets.
+        tails:    how many tails (at least 1). Pins fall between them, with
+                  a half pin at each edge.
+        angle:    splay in DEGREES, 0 to 45. 10 is a common hardwood angle;
+                  softwood is usually a little steeper.
+        across:   "x", "y" or "z" -- the axis the tails are spaced along.
+
+    The taper lies in the plane of the boards' faces, so each cut is still
+    a flat profile pushed through the thickness -- no SketchUp Pro needed.
+
+    Verified before commit: the two boards must together fill the overlap
+    exactly once, or the model is left untouched.
+    """
+    args = {"tail_id": tail_id, "pin_id": pin_id, "tails": tails, "angle": angle}
+    if across is not None:
+        args["across"] = across
+    return _call(ctx, "create_dovetail", args)
 
 @mcp.tool()
 def eval_ruby(

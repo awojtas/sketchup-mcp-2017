@@ -1185,26 +1185,6 @@ module SU_MCP
             "Accepted: #{allowed.join(', ')}."
     end
 
-    # The three joinery tools are disabled.
-    #
-    # Live testing on 2.6.0 found all three destroy the board they are given:
-    # a clean 800 cm3 manifold board comes back at -1 cubic inch (SketchUp's
-    # "not a solid" sentinel) and manifold? == false. They do not cut -- they
-    # displace, shear, or add material outside the workpiece -- and because
-    # nothing wraps them in an abortable operation, the damage is committed.
-    #
-    # The push/pull rewrite that was meant to remove their SketchUp Pro
-    # dependency introduced this, and it shipped without live verification.
-    # Refusing is the only responsible state until they are rebuilt on
-    # cut_pocket, which already does correctly the thing all three get wrong.
-    def joinery_disabled!(name)
-      raise "#{name} is disabled: it corrupts the workpiece rather than " \
-            "cutting it, and commits the damage. Use cut_pocket to remove " \
-            "material, or cut the joint interactively in SketchUp. " \
-            "Tracking: the tool needs rebuilding on cut_pocket's " \
-            "face-normal and post-condition logic."
-    end
-
     # Extrude a base face upward.
     #
     # add_face derives its normal from winding order, so a base face can come
@@ -1274,8 +1254,13 @@ module SU_MCP
       # -- makes the caller clean up after us.
       model.start_operation("MCP cut_pocket", true)
 
-      # Caller works in centimetres; SketchUp geometry is inches.
-      pts = points.map { |p| Geom::Point3d.new(p[0].to_f / 2.54, p[1].to_f / 2.54, p[2].to_f / 2.54) }
+      # Caller works in world-space centimetres, matching the bounds measure
+      # reports; SketchUp geometry is inches in the group's OWN space. Those
+      # coincide only while the group sits at the origin untransformed, so a
+      # profile taken from measure landed somewhere else entirely once the
+      # solid had been moved -- and a profile that misses the surface adds a
+      # detached slab rather than cutting.
+      pts = points.map { |p| world_cm_to_local(target, p) }
 
       face = entities.add_face(pts)
       raise "Could not create a face from those points -- they must be coplanar " \
@@ -1765,622 +1750,405 @@ module SU_MCP
       end
     end
     
-    def create_mortise_tenon(params)
-      joinery_disabled!("create_mortise_tenon")
+    # ──────────────────────────────────────────────────────────────────
+    # Joinery
+    # ──────────────────────────────────────────────────────────────────
+    #
+    # All three joints are the same shape of problem: two boards that
+    # overlap in space, and a set of prismatic cuts inside that overlap
+    # which leave the two halves interlocking. Nothing here needs Pro --
+    # every cut is a profile pushed into a face, the same gesture
+    # cut_pocket uses.
+    #
+    # The previous implementations took abstract width/height/depth plus
+    # offsets and guessed a face from a direction vector. They read the
+    # boards' WORLD bounds and then added faces into the boards' LOCAL
+    # entities, so the moment a board was moved the cuts landed somewhere
+    # else -- which is how they came to shear and displace the workpiece
+    # instead of cutting it. Geometry is derived from the overlap here,
+    # every point is converted world -> local before use, and each board
+    # is addressed by the ROLE the caller gave it rather than by where it
+    # happens to sit.
 
-      log "Creating mortise and tenon joint with params: #{params.inspect}"
-      model = Sketchup.active_model
-      
-      # Get the mortise and tenon board IDs
-      mortise_id = params["mortise_id"].to_s.gsub('"', '')
-      tenon_id = params["tenon_id"].to_s.gsub('"', '')
-      
-      log "Looking for mortise board with ID: #{mortise_id}"
-      mortise_board = model.find_entity_by_id(mortise_id.to_i)
-      
-      log "Looking for tenon board with ID: #{tenon_id}"
-      tenon_board = model.find_entity_by_id(tenon_id.to_i)
-      
-      unless mortise_board && tenon_board
-        missing = []
-        missing << "mortise board" unless mortise_board
-        missing << "tenon board" unless tenon_board
-        raise "Entity not found: #{missing.join(', ')}"
-      end
-      
-      # Ensure both entities are groups or component instances
-      unless (mortise_board.is_a?(Sketchup::Group) || mortise_board.is_a?(Sketchup::ComponentInstance)) &&
-             (tenon_board.is_a?(Sketchup::Group) || tenon_board.is_a?(Sketchup::ComponentInstance))
-        raise "Mortise and tenon operation requires groups or component instances"
-      end
-      
-      # Get joint parameters
-      width = params["width"] || 1.0
-      height = params["height"] || 1.0
-      depth = params["depth"] || 1.0
-      offset_x = params["offset_x"] || 0.0
-      offset_y = params["offset_y"] || 0.0
-      offset_z = params["offset_z"] || 0.0
-      
-      # Get the bounds of both boards
-      mortise_bounds = mortise_board.bounds
-      tenon_bounds = tenon_board.bounds
-      
-      # Determine the face to place the joint on based on the relative positions of the boards
-      mortise_center = mortise_bounds.center
-      tenon_center = tenon_bounds.center
-      
-      # Calculate the direction vector from mortise to tenon
-      direction_vector = tenon_center - mortise_center
-      
-      # Determine which face of the mortise board is closest to the tenon board
-      mortise_face_direction = determine_closest_face(direction_vector)
-      
-      # Create the mortise (hole) in the mortise board
-      mortise_result = create_mortise(
-        mortise_board, 
-        width, 
-        height, 
-        depth, 
-        mortise_face_direction,
-        mortise_bounds,
-        offset_x, 
-        offset_y, 
-        offset_z
-      )
-      
-      # Determine which face of the tenon board is closest to the mortise board
-      tenon_face_direction = determine_closest_face(direction_vector.reverse)
-      
-      # Create the tenon (projection) on the tenon board
-      tenon_result = create_tenon(
-        tenon_board, 
-        width, 
-        height, 
-        depth, 
-        tenon_face_direction,
-        tenon_bounds,
-        offset_x, 
-        offset_y, 
-        offset_z
-      )
-      
-      # Return the result
-      { 
-        success: true, 
-        mortise_id: mortise_result[:id],
-        tenon_id: tenon_result[:id]
-      }
-    end
-    
-    def determine_closest_face(direction_vector)
-      # Normalize the direction vector
-      direction_vector.normalize!
-      
-      # Determine which axis has the largest component
-      x_abs = direction_vector.x.abs
-      y_abs = direction_vector.y.abs
-      z_abs = direction_vector.z.abs
-      
-      if x_abs >= y_abs && x_abs >= z_abs
-        # X-axis is dominant
-        return direction_vector.x > 0 ? :east : :west
-      elsif y_abs >= x_abs && y_abs >= z_abs
-        # Y-axis is dominant
-        return direction_vector.y > 0 ? :north : :south
-      else
-        # Z-axis is dominant
-        return direction_vector.z > 0 ? :top : :bottom
-      end
-    end
-    
-    def create_mortise(board, width, height, depth, face_direction, bounds, offset_x, offset_y, offset_z)
-      model = Sketchup.active_model
-      
-      # Get the board's entities
-      entities = board.is_a?(Sketchup::Group) ? board.entities : board.definition.entities
-      
-      # Calculate the position of the mortise based on the face direction
-      mortise_position = calculate_position_on_face(face_direction, bounds, width, height, depth, offset_x, offset_y, offset_z)
-      
-      log "Creating mortise at position: #{mortise_position.inspect} with dimensions: #{[width, height, depth].inspect}"
-      
-      # Draw the mortise profile directly on the board and push it inward --
-      # the same gesture a person uses, and it works on every SketchUp edition.
-      # The previous approach built a separate box and subtracted it, which
-      # needs the Pro-only solid tools for a cut that does not require them.
-      mortise_group = nil
-      
-      # Create the mortise box with the correct orientation
-      case face_direction
-      when :east, :west
-        # Mortise on east or west face (YZ plane)
-        mortise_face = entities.add_face(
-          [mortise_position[0], mortise_position[1], mortise_position[2]],
-          [mortise_position[0], mortise_position[1] + width, mortise_position[2]],
-          [mortise_position[0], mortise_position[1] + width, mortise_position[2] + height],
-          [mortise_position[0], mortise_position[1], mortise_position[2] + height]
-        )
-        pushpull_into(mortise_face, entities, depth)
-      when :north, :south
-        # Mortise on north or south face (XZ plane)
-        mortise_face = entities.add_face(
-          [mortise_position[0], mortise_position[1], mortise_position[2]],
-          [mortise_position[0] + width, mortise_position[1], mortise_position[2]],
-          [mortise_position[0] + width, mortise_position[1], mortise_position[2] + height],
-          [mortise_position[0], mortise_position[1], mortise_position[2] + height]
-        )
-        pushpull_into(mortise_face, entities, depth)
-      when :top, :bottom
-        # Mortise on top or bottom face (XY plane)
-        mortise_face = entities.add_face(
-          [mortise_position[0], mortise_position[1], mortise_position[2]],
-          [mortise_position[0] + width, mortise_position[1], mortise_position[2]],
-          [mortise_position[0] + width, mortise_position[1] + height, mortise_position[2]],
-          [mortise_position[0], mortise_position[1] + height, mortise_position[2]]
-        )
-        pushpull_into(mortise_face, entities, depth)
-      end
-      
-      # Nothing to subtract: pushing the profile inward removed the material.
-      
-      # Clean up the temporary group
-      mortise_group.erase!
-      
-      # Return the result
-      { 
-        success: true, 
-        id: board.entityID
-      }
-    end
-    
-    def create_tenon(board, width, height, depth, face_direction, bounds, offset_x, offset_y, offset_z)
-      model = Sketchup.active_model
-      
-      # Get the board's entities
-      entities = board.is_a?(Sketchup::Group) ? board.entities : board.definition.entities
-      
-      # Calculate the position of the tenon based on the face direction
-      tenon_position = calculate_position_on_face(face_direction, bounds, width, height, depth, offset_x, offset_y, offset_z)
-      
-      log "Creating tenon at position: #{tenon_position.inspect} with dimensions: #{[width, height, depth].inspect}"
-      
-      # Create a box for the tenon
-      tenon_group = model.active_entities.add_group
-      
-      # Create the tenon box with the correct orientation
-      case face_direction
-      when :east, :west
-        # Tenon on east or west face (YZ plane)
-        tenon_face = tenon_group.entities.add_face(
-          [tenon_position[0], tenon_position[1], tenon_position[2]],
-          [tenon_position[0], tenon_position[1] + width, tenon_position[2]],
-          [tenon_position[0], tenon_position[1] + width, tenon_position[2] + height],
-          [tenon_position[0], tenon_position[1], tenon_position[2] + height]
-        )
-        tenon_face.pushpull(face_direction == :east ? depth : -depth)
-      when :north, :south
-        # Tenon on north or south face (XZ plane)
-        tenon_face = tenon_group.entities.add_face(
-          [tenon_position[0], tenon_position[1], tenon_position[2]],
-          [tenon_position[0] + width, tenon_position[1], tenon_position[2]],
-          [tenon_position[0] + width, tenon_position[1], tenon_position[2] + height],
-          [tenon_position[0], tenon_position[1], tenon_position[2] + height]
-        )
-        tenon_face.pushpull(face_direction == :north ? depth : -depth)
-      when :top, :bottom
-        # Tenon on top or bottom face (XY plane)
-        tenon_face = tenon_group.entities.add_face(
-          [tenon_position[0], tenon_position[1], tenon_position[2]],
-          [tenon_position[0] + width, tenon_position[1], tenon_position[2]],
-          [tenon_position[0] + width, tenon_position[1] + height, tenon_position[2]],
-          [tenon_position[0], tenon_position[1] + height, tenon_position[2]]
-        )
-        tenon_face.pushpull(face_direction == :top ? depth : -depth)
-      end
-      
-      # Get the transformation of the board
-      board_transform = board.transformation
-      
-      # Apply the inverse transformation to the tenon group
-      tenon_group.transform!(board_transform.inverse)
-      
-      # Union the tenon with the board
-      board_entities = board.is_a?(Sketchup::Group) ? board.entities : board.definition.entities
-      board_entities.add_instance(tenon_group.entities.parent, Geom::Transformation.new)
-      
-      # Clean up the temporary group
-      tenon_group.erase!
-      
-      # Return the result
-      { 
-        success: true, 
-        id: board.entityID
-      }
-    end
-    
-    def calculate_position_on_face(face_direction, bounds, width, height, depth, offset_x, offset_y, offset_z)
-      # Calculate the position on the specified face with offsets
-      case face_direction
-      when :east
-        # Position on the east face (max X)
-        [
-          bounds.max.x,
-          bounds.center.y - width/2 + offset_y,
-          bounds.center.z - height/2 + offset_z
-        ]
-      when :west
-        # Position on the west face (min X)
-        [
-          bounds.min.x,
-          bounds.center.y - width/2 + offset_y,
-          bounds.center.z - height/2 + offset_z
-        ]
-      when :north
-        # Position on the north face (max Y)
-        [
-          bounds.center.x - width/2 + offset_x,
-          bounds.max.y,
-          bounds.center.z - height/2 + offset_z
-        ]
-      when :south
-        # Position on the south face (min Y)
-        [
-          bounds.center.x - width/2 + offset_x,
-          bounds.min.y,
-          bounds.center.z - height/2 + offset_z
-        ]
-      when :top
-        # Position on the top face (max Z)
-        [
-          bounds.center.x - width/2 + offset_x,
-          bounds.center.y - height/2 + offset_y,
-          bounds.max.z
-        ]
-      when :bottom
-        # Position on the bottom face (min Z)
-        [
-          bounds.center.x - width/2 + offset_x,
-          bounds.center.y - height/2 + offset_y,
-          bounds.min.z
-        ]
-      end
-    end
-    
-    def create_dovetail(params)
-      joinery_disabled!("create_dovetail")
+    AXIS_NAMES = %w[x y z].freeze
 
-      log "Creating dovetail joint with params: #{params.inspect}"
-      model = Sketchup.active_model
-      
-      # Get the tail and pin board IDs
-      tail_id = params["tail_id"].to_s.gsub('"', '')
-      pin_id = params["pin_id"].to_s.gsub('"', '')
-      
-      log "Looking for tail board with ID: #{tail_id}"
-      tail_board = model.find_entity_by_id(tail_id.to_i)
-      
-      log "Looking for pin board with ID: #{pin_id}"
-      pin_board = model.find_entity_by_id(pin_id.to_i)
-      
-      unless tail_board && pin_board
-        missing = []
-        missing << "tail board" unless tail_board
-        missing << "pin board" unless pin_board
-        raise "Entity not found: #{missing.join(', ')}"
-      end
-      
-      # Ensure both entities are groups or component instances
-      unless (tail_board.is_a?(Sketchup::Group) || tail_board.is_a?(Sketchup::ComponentInstance)) &&
-             (pin_board.is_a?(Sketchup::Group) || pin_board.is_a?(Sketchup::ComponentInstance))
-        raise "Dovetail operation requires groups or component instances"
-      end
-      
-      # Get joint parameters
-      width = params["width"] || 1.0
-      height = params["height"] || 2.0
-      depth = params["depth"] || 1.0
-      angle = params["angle"] || 15.0  # Dovetail angle in degrees
-      num_tails = params["num_tails"] || 3
-      offset_x = params["offset_x"] || 0.0
-      offset_y = params["offset_y"] || 0.0
-      offset_z = params["offset_z"] || 0.0
-      
-      # Create the tails on the tail board
-      tail_result = create_tails(tail_board, width, height, depth, angle, num_tails, offset_x, offset_y, offset_z)
-      
-      # Create the pins on the pin board
-      pin_result = create_pins(pin_board, width, height, depth, angle, num_tails, offset_x, offset_y, offset_z)
-      
-      # Return the result
-      { 
-        success: true, 
-        tail_id: tail_result[:id],
-        pin_id: pin_result[:id]
-      }
+    # Caller coordinates are world-space centimetres, matching what
+    # measure reports. Group geometry lives in the group's own space.
+    def world_cm_to_local(entity, coords)
+      point = Geom::Point3d.new(coords[0].to_f / 2.54,
+                                coords[1].to_f / 2.54,
+                                coords[2].to_f / 2.54)
+      point.transform(entity.transformation.inverse)
     end
-    
-    def create_tails(board, width, height, depth, angle, num_tails, offset_x, offset_y, offset_z)
-      model = Sketchup.active_model
-      
-      # Get the board's entities
-      entities = board.is_a?(Sketchup::Group) ? board.entities : board.definition.entities
-      
-      # Get the board's bounds
-      bounds = board.bounds
-      
-      # Calculate the position of the dovetail joint
-      center_x = bounds.center.x + offset_x
-      center_y = bounds.center.y + offset_y
-      center_z = bounds.center.z + offset_z
-      
-      # Calculate the width of each tail and space
-      total_width = width
-      tail_width = total_width / (2 * num_tails - 1)
-      
-      # Create a group for the tails
-      tails_group = entities.add_group
-      
-      # Create each tail
-      num_tails.times do |i|
-        # Calculate the position of this tail
-        tail_center_x = center_x - width/2 + tail_width * (2 * i)
-        
-        # Calculate the dovetail shape
-        angle_rad = angle * Math::PI / 180.0
-        tail_top_width = tail_width
-        tail_bottom_width = tail_width + 2 * depth * Math.tan(angle_rad)
-        
-        # Create the tail shape
-        tail_points = [
-          [tail_center_x - tail_top_width/2, center_y - height/2, center_z],
-          [tail_center_x + tail_top_width/2, center_y - height/2, center_z],
-          [tail_center_x + tail_bottom_width/2, center_y - height/2, center_z - depth],
-          [tail_center_x - tail_bottom_width/2, center_y - height/2, center_z - depth]
-        ]
-        
-        # Create the tail face
-        tail_face = tails_group.entities.add_face(tail_points)
-        
-        # Extrude the tail
-        pushpull_into(tail_face, pins_group.entities, height)
-      end
-      
-      # Return the result
-      { 
-        success: true, 
-        id: board.entityID
-      }
+
+    def world_bounds_cm(entity)
+      bb = entity.bounds
+      { :min => [bb.min.x * 2.54, bb.min.y * 2.54, bb.min.z * 2.54],
+        :max => [bb.max.x * 2.54, bb.max.y * 2.54, bb.max.z * 2.54] }
     end
-    
-    def create_pins(board, width, height, depth, angle, num_tails, offset_x, offset_y, offset_z)
-      model = Sketchup.active_model
-      
-      # Get the board's entities
-      entities = board.is_a?(Sketchup::Group) ? board.entities : board.definition.entities
-      
-      # Get the board's bounds
-      bounds = board.bounds
-      
-      # Calculate the position of the dovetail joint
-      center_x = bounds.center.x + offset_x
-      center_y = bounds.center.y + offset_y
-      center_z = bounds.center.z + offset_z
-      
-      # Calculate the width of each tail and space
-      total_width = width
-      tail_width = total_width / (2 * num_tails - 1)
-      
-      # Create a group for the pins
-      pins_group = entities.add_group
-      
-      # Create a box for the entire pin area
-      pin_area_face = pins_group.entities.add_face(
-        [center_x - width/2, center_y - height/2, center_z],
-        [center_x + width/2, center_y - height/2, center_z],
-        [center_x + width/2, center_y + height/2, center_z],
-        [center_x - width/2, center_y + height/2, center_z]
-      )
-      
-      # Extrude the pin area
-      pin_area_face.pushpull(depth)
-      
-      # Create each tail cutout
-      num_tails.times do |i|
-        # Calculate the position of this tail
-        tail_center_x = center_x - width/2 + tail_width * (2 * i)
-        
-        # Calculate the dovetail shape
-        angle_rad = angle * Math::PI / 180.0
-        tail_top_width = tail_width
-        tail_bottom_width = tail_width + 2 * depth * Math.tan(angle_rad)
-        
-        # Create a group for the tail cutout
-        # Drawn straight onto the pin block and pushed through -- no solid op.
-        
-        # Create the tail cutout shape
-        tail_points = [
-          [tail_center_x - tail_top_width/2, center_y - height/2, center_z],
-          [tail_center_x + tail_top_width/2, center_y - height/2, center_z],
-          [tail_center_x + tail_bottom_width/2, center_y - height/2, center_z - depth],
-          [tail_center_x - tail_bottom_width/2, center_y - height/2, center_z - depth]
-        ]
-        
-        # Create the tail cutout face
-        tail_face = pins_group.entities.add_face(tail_points)
-        
-        # Extrude the tail cutout
-        pushpull_into(tail_face, pins_group.entities, height)
-        
-        # The push already removed the material; nothing to subtract.
-      end
-      
-      # Return the result
-      { 
-        success: true, 
-        id: board.entityID
-      }
+
+    def bounds_centre_cm(box)
+      (0..2).map { |i| (box[:min][i] + box[:max][i]) / 2.0 }
     end
-    
+
+    # The region the joint is cut in: where the two boards share space.
+    def joint_overlap_cm(a, b)
+      ba = world_bounds_cm(a)
+      bb = world_bounds_cm(b)
+      min = (0..2).map { |i| [ba[:min][i], bb[:min][i]].max }
+      max = (0..2).map { |i| [ba[:max][i], bb[:max][i]].min }
+
+      if (0..2).any? { |i| max[i] - min[i] <= 1e-6 }
+        raise "The two boards do not overlap, so there is no region to cut " \
+              "the joint in. Position them so the joint end of one sits " \
+              "inside the other by the depth of the joint. Board bounds " \
+              "(cm): #{ba[:min].map { |v| v.round(2) }}-" \
+              "#{ba[:max].map { |v| v.round(2) }} and " \
+              "#{bb[:min].map { |v| v.round(2) }}-#{bb[:max].map { |v| v.round(2) }}."
+      end
+
+      { :min => min, :max => max }
+    end
+
+    # The axis along which the boards approach each other. Taken from the
+    # separation of their centres rather than guessed from a face normal:
+    # if the boards meet end to end, that separation is unambiguous.
+    def joint_axis(a, b)
+      ca = bounds_centre_cm(world_bounds_cm(a))
+      cb = bounds_centre_cm(world_bounds_cm(b))
+      sep = (0..2).map { |i| (cb[i] - ca[i]).abs }
+      axis = sep.index(sep.max)
+
+      rival = ((0..2).to_a - [axis]).map { |i| sep[i] }.max
+      if sep[axis] <= 1e-6 || rival > sep[axis] * 0.5
+        raise "Cannot tell which way the boards meet: their centres are " \
+              "separated by #{sep.map { |v| v.round(2) }} cm on x/y/z, which " \
+              "is ambiguous. Joinery expects two boards meeting along one " \
+              "axis; position them so they are offset mainly on a single one."
+      end
+
+      axis
+    end
+
+    # A profile in the plane perpendicular to `normal_axis`, built from
+    # (u, v) pairs and returned as world-centimetre points.
+    def joint_profile(normal_axis, u_axis, v_axis, plane, uv_pairs)
+      uv_pairs.map do |pair|
+        p = [0.0, 0.0, 0.0]
+        p[normal_axis] = plane
+        p[u_axis] = pair[0]
+        p[v_axis] = pair[1]
+        p
+      end
+    end
+
+    def joint_rect(normal_axis, u_axis, v_axis, plane, u0, u1, v0, v1)
+      joint_profile(normal_axis, u_axis, v_axis, plane,
+                    [[u0, v0], [u1, v0], [u1, v1], [u0, v1]])
+    end
+
+    # One prismatic cut. Deliberately does NOT open an operation: a joint is
+    # several coordinated cuts and a half-cut joint is worse than none, so
+    # the caller wraps the whole set in a single abortable operation.
+    def apply_joint_cut(entity, points_world_cm, depth_cm)
+      entities = entity.is_a?(Sketchup::Group) ? entity.entities : entity.definition.entities
+      face = entities.add_face(points_world_cm.map { |p| world_cm_to_local(entity, p) })
+      raise "Could not create a cut profile on ##{entity.entityID}: the " \
+            "profile must be coplanar and lie on one face of the board." unless face
+      pushpull_into(face, entities, depth_cm / 2.54)
+    end
+
+    # Shared driver: work out the joint frame, run the cuts inside one
+    # operation, and verify the result before committing.
+    #
+    # The post-condition that matters is the volume identity. After any of
+    # these joints the two boards must between them fill the overlap region
+    # exactly once, so:
+    #
+    #   volume(a) + volume(b) == before(a) + before(b) - volume(overlap)
+    #
+    # That single identity catches material added instead of removed, cuts
+    # placed on the wrong board, cuts that missed the overlap, gaps, and
+    # the two halves interpenetrating -- every failure mode the old
+    # implementations shipped with.
+    def build_joint(params, name, id_keys, extra_keys)
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      reject_unknown_params!(params, id_keys + extra_keys, name)
+
+      role_a, role_b = id_keys.map { |k| k.sub(/_id\z/, "") }
+      a = resolve_solid(model, params[id_keys[0]], role_a)
+      b = resolve_solid(model, params[id_keys[1]], role_b)
+      if a.entityID == b.entityID
+        raise "#{name}: #{id_keys[0]} and #{id_keys[1]} are the same entity " \
+              "(##{a.entityID})"
+      end
+
+      before_a = solid_stats(a)
+      before_b = solid_stats(b)
+      [[a, before_a], [b, before_b]].each do |entity, stats|
+        unless stats[:manifold] && stats[:volume_cm3]
+          raise "board ##{entity.entityID} is not a manifold solid, so a joint " \
+                "cut into it would be undefined. Fix the geometry first."
+        end
+      end
+
+      axis    = joint_axis(a, b)
+      overlap = joint_overlap_cm(a, b)
+      j0 = overlap[:min][axis]
+      j1 = overlap[:max][axis]
+
+      # The board sitting lower on the joint axis reaches up to the far side
+      # of the overlap; the higher one starts at the near side. Anything else
+      # is one board passing through another, not two boards meeting.
+      a_is_low = bounds_centre_cm(world_bounds_cm(a))[axis] <
+                 bounds_centre_cm(world_bounds_cm(b))[axis]
+      low = a_is_low ? a : b
+      high = a_is_low ? b : a
+      unless (world_bounds_cm(low)[:max][axis] - j1).abs < 1e-3 &&
+             (world_bounds_cm(high)[:min][axis] - j0).abs < 1e-3
+        raise "The boards do not meet end to end on the #{AXIS_NAMES[axis]} " \
+              "axis -- one passes through the other rather than butting " \
+              "against it. The joint region must be the end of one board " \
+              "overlapping the end of the other."
+      end
+
+      others = (0..2).to_a - [axis]
+      across = if params["across"]
+                 idx = AXIS_NAMES.index(params["across"].to_s.downcase)
+                 raise "across must be one of x, y, z" unless idx
+                 if idx == axis
+                   raise "across cannot be #{AXIS_NAMES[axis]}: that is the " \
+                         "axis the boards meet along."
+                 end
+                 idx
+               else
+                 # Fingers and tails run across the width of a board, so
+                 # default to the wider of the two remaining directions.
+                 others.max_by { |i| overlap[:max][i] - overlap[:min][i] }
+               end
+      through = (others - [across])[0]
+
+      # Each board's cuts start from its own end face and run inward. Bind
+      # this to the board, not to a position, so a planner that says "cut
+      # the socket into the mortise board" cannot silently cut the other one.
+      end_plane      = {}
+      shoulder_plane = {}
+      end_plane[low.entityID]       = j1
+      shoulder_plane[low.entityID]  = j0
+      end_plane[high.entityID]      = j0
+      shoulder_plane[high.entityID] = j1
+
+      frame = {
+        :axis => axis, :across => across, :through => through,
+        :j0 => j0, :j1 => j1, :depth => j1 - j0,
+        :a0 => overlap[:min][across], :a1 => overlap[:max][across],
+        :t0 => overlap[:min][through], :t1 => overlap[:max][through],
+        :a => a, :b => b, :low => low, :high => high,
+        :end_plane => end_plane, :shoulder_plane => shoulder_plane
+      }
+
+      cuts = yield(frame, params)
+
+      overlap_volume = (0..2).inject(1.0) do |acc, i|
+        acc * (overlap[:max][i] - overlap[:min][i])
+      end
+
+      committed = false
+      begin
+        model.start_operation("MCP #{name}", true)
+        cuts.each { |cut| apply_joint_cut(cut[0], cut[1], cut[2]) }
+
+        after_a = solid_stats(a)
+        after_b = solid_stats(b)
+
+        unless after_a[:manifold] && after_b[:manifold] &&
+               after_a[:volume_cm3] && after_b[:volume_cm3]
+          raise "The joint left a board non-manifold, so the cuts did not lie " \
+                "cleanly on the boards. The model was left unchanged."
+        end
+
+        expected  = before_a[:volume_cm3] + before_b[:volume_cm3] - overlap_volume
+        actual    = after_a[:volume_cm3] + after_b[:volume_cm3]
+        tolerance = [overlap_volume * 0.001, 0.01].max
+
+        if (actual - expected).abs > tolerance
+          raise "The joint does not interlock: the two boards together come " \
+                "to #{actual.round(3)} cm3, where halves filling the overlap " \
+                "exactly once would be #{expected.round(3)} cm3 (out by " \
+                "#{(actual - expected).round(3)}). They overlap or leave a " \
+                "gap. The model was left unchanged."
+        end
+
+        model.commit_operation
+        committed = true
+
+        {
+          success: true,
+          result: {
+            joint: name,
+            axis: AXIS_NAMES[axis],
+            across: AXIS_NAMES[across],
+            depth_cm: (j1 - j0).round(3),
+            overlap_cm3: overlap_volume.round(3),
+            cuts: cuts.length,
+            boards: [
+              { id: a.entityID, role: role_a, before: before_a, after: after_a,
+                removed_cm3: (before_a[:volume_cm3] - after_a[:volume_cm3]).round(3) },
+              { id: b.entityID, role: role_b, before: before_b, after: after_b,
+                removed_cm3: (before_b[:volume_cm3] - after_b[:volume_cm3]).round(3) }
+            ]
+          }
+        }
+      ensure
+        if !committed && model.respond_to?(:abort_operation)
+          model.abort_operation rescue nil
+        end
+      end
+    end
+
+    # Box joint: alternating square fingers across the width of the joint.
     def create_finger_joint(params)
-      joinery_disabled!("create_finger_joint")
+      build_joint(params, "create_finger_joint",
+                  %w[board1_id board2_id], %w[fingers across]) do |f, p|
+        count = (p["fingers"] || 5).to_i
+        raise "fingers must be at least 2" if count < 2
 
-      log "Creating finger joint with params: #{params.inspect}"
-      model = Sketchup.active_model
-      
-      # Get the two board IDs
-      board1_id = params["board1_id"].to_s.gsub('"', '')
-      board2_id = params["board2_id"].to_s.gsub('"', '')
-      
-      log "Looking for board 1 with ID: #{board1_id}"
-      board1 = model.find_entity_by_id(board1_id.to_i)
-      
-      log "Looking for board 2 with ID: #{board2_id}"
-      board2 = model.find_entity_by_id(board2_id.to_i)
-      
-      unless board1 && board2
-        missing = []
-        missing << "board 1" unless board1
-        missing << "board 2" unless board2
-        raise "Entity not found: #{missing.join(', ')}"
+        width = (f[:a1] - f[:a0]) / count.to_f
+        cuts = []
+        (0...count).each do |i|
+          u0 = f[:a0] + i * width
+          # board1 keeps the even bands, board2 the odd ones, so between
+          # them they fill the overlap exactly once.
+          board = i.odd? ? f[:a] : f[:b]
+          cuts << [board,
+                   joint_rect(f[:axis], f[:across], f[:through],
+                              f[:end_plane][board.entityID],
+                              u0, u0 + width, f[:t0], f[:t1]),
+                   f[:depth]]
+        end
+        cuts
       end
-      
-      # Ensure both entities are groups or component instances
-      unless (board1.is_a?(Sketchup::Group) || board1.is_a?(Sketchup::ComponentInstance)) &&
-             (board2.is_a?(Sketchup::Group) || board2.is_a?(Sketchup::ComponentInstance))
-        raise "Finger joint operation requires groups or component instances"
-      end
-      
-      # Get joint parameters
-      width = params["width"] || 1.0
-      height = params["height"] || 2.0
-      depth = params["depth"] || 1.0
-      num_fingers = params["num_fingers"] || 5
-      offset_x = params["offset_x"] || 0.0
-      offset_y = params["offset_y"] || 0.0
-      offset_z = params["offset_z"] || 0.0
-      
-      # Create the fingers on board 1
-      board1_result = create_board1_fingers(board1, width, height, depth, num_fingers, offset_x, offset_y, offset_z)
-      
-      # Create the matching slots on board 2
-      board2_result = create_board2_slots(board2, width, height, depth, num_fingers, offset_x, offset_y, offset_z)
-      
-      # Return the result
-      { 
-        success: true, 
-        board1_id: board1_result[:id],
-        board2_id: board2_result[:id]
-      }
     end
-    
-    def create_board1_fingers(board, width, height, depth, num_fingers, offset_x, offset_y, offset_z)
-      model = Sketchup.active_model
-      
-      # Get the board's entities
-      entities = board.is_a?(Sketchup::Group) ? board.entities : board.definition.entities
-      
-      # Get the board's bounds
-      bounds = board.bounds
-      
-      # Calculate the position of the joint
-      center_x = bounds.center.x + offset_x
-      center_y = bounds.center.y + offset_y
-      center_z = bounds.center.z + offset_z
-      
-      # Calculate the width of each finger
-      finger_width = width / num_fingers
-      
-      # Create a group for the fingers
-      fingers_group = entities.add_group
-      
-      # Create a base rectangle for the joint area
-      base_face = fingers_group.entities.add_face(
-        [center_x - width/2, center_y - height/2, center_z],
-        [center_x + width/2, center_y - height/2, center_z],
-        [center_x + width/2, center_y + height/2, center_z],
-        [center_x - width/2, center_y + height/2, center_z]
-      )
-      
-      # Create cutouts for the spaces between fingers
-      (num_fingers / 2).times do |i|
-        # Calculate the position of this cutout
-        cutout_center_x = center_x - width/2 + finger_width * (2 * i + 1)
-        
-        # Create a group for the cutout
-        # Drawn onto the workpiece and pushed through -- no solid op.
-        
-        # Create the cutout shape
-        cutout_face = fingers_group.entities.add_face(
-          [cutout_center_x - finger_width/2, center_y - height/2, center_z],
-          [cutout_center_x + finger_width/2, center_y - height/2, center_z],
-          [cutout_center_x + finger_width/2, center_y + height/2, center_z],
-          [cutout_center_x - finger_width/2, center_y + height/2, center_z]
-        )
-        
-        # Extrude the cutout
-        pushpull_into(cutout_face, fingers_group.entities, depth)
-        
-        # The push already removed the material; nothing to subtract.
+
+    # Mortise and tenon: a rectangular socket in one board, and the matching
+    # stub left on the other by cutting its four shoulders away.
+    def create_mortise_tenon(params)
+      build_joint(params, "create_mortise_tenon",
+                  %w[mortise_id tenon_id], %w[width height across]) do |f, p|
+        span_a = f[:a1] - f[:a0]
+        span_t = f[:t1] - f[:t0]
+        w = (p["width"]  || span_a / 2.0).to_f
+        h = (p["height"] || span_t / 3.0).to_f
+
+        if w <= 0 || w >= span_a
+          raise "width must be between 0 and #{span_a.round(2)} cm, the joint's " \
+                "extent across #{AXIS_NAMES[f[:across]]}"
+        end
+        if h <= 0 || h >= span_t
+          raise "height must be between 0 and #{span_t.round(2)} cm, the joint's " \
+                "extent across #{AXIS_NAMES[f[:through]]}"
+        end
+
+        # Centred on the overlap.
+        ac = (f[:a0] + f[:a1]) / 2.0
+        tc = (f[:t0] + f[:t1]) / 2.0
+        u0 = ac - w / 2.0
+        u1 = ac + w / 2.0
+        v0 = tc - h / 2.0
+        v1 = tc + h / 2.0
+
+        mortise = f[:a]
+        tenon   = f[:b]
+        cuts = []
+        # The socket, cut into the mortise board's end face.
+        cuts << [mortise,
+                 joint_rect(f[:axis], f[:across], f[:through],
+                            f[:end_plane][mortise.entityID], u0, u1, v0, v1),
+                 f[:depth]]
+        # The four shoulders, cut off the tenon board, leaving the stub.
+        [[f[:a0], f[:a1], f[:t0], v0],
+         [f[:a0], f[:a1], v1, f[:t1]],
+         [f[:a0], u0, v0, v1],
+         [u1, f[:a1], v0, v1]].each do |s|
+          next if (s[1] - s[0]).abs < 1e-9 || (s[3] - s[2]).abs < 1e-9
+          cuts << [tenon,
+                   joint_rect(f[:axis], f[:across], f[:through],
+                              f[:end_plane][tenon.entityID], s[0], s[1], s[2], s[3]),
+                   f[:depth]]
+        end
+        cuts
       end
-      
-      # Extrude the fingers
-      base_face.pushpull(depth)
-      
-      # Return the result
-      { 
-        success: true, 
-        id: board.entityID
-      }
     end
-    
-    def create_board2_slots(board, width, height, depth, num_fingers, offset_x, offset_y, offset_z)
-      model = Sketchup.active_model
-      
-      # Get the board's entities
-      entities = board.is_a?(Sketchup::Group) ? board.entities : board.definition.entities
-      
-      # Get the board's bounds
-      bounds = board.bounds
-      
-      # Calculate the position of the joint
-      center_x = bounds.center.x + offset_x
-      center_y = bounds.center.y + offset_y
-      center_z = bounds.center.z + offset_z
-      
-      # Calculate the width of each finger
-      finger_width = width / num_fingers
-      
-      # Create a group for the slots
-      slots_group = entities.add_group
-      
-      # Create cutouts for the fingers from board 1
-      (num_fingers / 2 + num_fingers % 2).times do |i|
-        # Calculate the position of this cutout
-        cutout_center_x = center_x - width/2 + finger_width * (2 * i)
-        
-        # Create a group for the cutout
-        # Drawn onto the workpiece and pushed through -- no solid op.
-        
-        # Create the cutout shape
-        cutout_face = entities.add_face(
-          [cutout_center_x - finger_width/2, center_y - height/2, center_z],
-          [cutout_center_x + finger_width/2, center_y - height/2, center_z],
-          [cutout_center_x + finger_width/2, center_y + height/2, center_z],
-          [cutout_center_x - finger_width/2, center_y + height/2, center_z]
-        )
-        
-        # Extrude the cutout
-        pushpull_into(cutout_face, entities, depth)
-        
-        # The push already removed the material; nothing to subtract.
+
+    # Through dovetail. The taper lies in the plane of the boards' faces, so
+    # each waste region is still a flat profile pushed straight through the
+    # thickness -- prismatic, and therefore no Pro requirement.
+    def create_dovetail(params)
+      build_joint(params, "create_dovetail",
+                  %w[tail_id pin_id], %w[tails angle across]) do |f, p|
+        count = (p["tails"] || 2).to_i
+        raise "tails must be at least 1" if count < 1
+        angle = (p["angle"] || 10.0).to_f
+        raise "angle must be between 0 and 45 degrees" if angle <= 0 || angle >= 45
+
+        span  = f[:a1] - f[:a0]
+        unit  = span / (2 * count + 1).to_f
+        splay = f[:depth] * Math.tan(angle * Math::PI / 180.0)
+        if splay >= unit
+          raise "angle #{angle} splays the tails by #{splay.round(2)} cm over a " \
+                "#{f[:depth].round(2)} cm joint, wider than the #{unit.round(2)} " \
+                "cm spacing. Use a smaller angle or fewer tails."
+        end
+
+        tail_board = f[:a]
+        pin_board  = f[:b]
+        # Tails are narrow at the shoulder and wide at the tail board's own
+        # end -- the flare is what stops the joint pulling apart.
+        shoulder = f[:shoulder_plane][tail_board.entityID]
+        tip      = f[:end_plane][tail_board.entityID]
+        thickness = f[:t1] - f[:t0]
+
+        tails = (0...count).map do |k|
+          lo_edge = f[:a0] + (2 * k + 1) * unit
+          [lo_edge, lo_edge + unit]
+        end
+
+        # Waste between and outside the tails, taken off the tail board. The
+        # profile lies on the board's face and is pushed through the full
+        # thickness, so the taper stays a flat extrusion.
+        regions = []
+        prev = f[:a0]
+        tails.each do |t|
+          regions << [prev, t[0]]
+          prev = t[1]
+        end
+        regions << [prev, f[:a1]]
+
+        cuts = []
+        regions.each_with_index do |r, i|
+          next if (r[1] - r[0]).abs < 1e-9
+          # A waste region narrows by the splay wherever it abuts a tail; the
+          # two outer regions abut one on a single side only.
+          e0 = (i == 0) ? r[0] : r[0] + splay
+          e1 = (i == regions.length - 1) ? r[1] : r[1] - splay
+          cuts << [tail_board,
+                   joint_profile(f[:through], f[:axis], f[:across], f[:t1],
+                                 [[shoulder, r[0]], [tip, e0],
+                                  [tip, e1], [shoulder, r[1]]]),
+                   thickness]
+        end
+
+        # Sockets in the pin board, exactly the tail shapes.
+        tails.each do |t|
+          cuts << [pin_board,
+                   joint_profile(f[:through], f[:axis], f[:across], f[:t1],
+                                 [[shoulder, t[0]], [tip, t[0] - splay],
+                                  [tip, t[1] + splay], [shoulder, t[1]]]),
+                   thickness]
+        end
+        cuts
       end
-      
-      # Return the result
-      { 
-        success: true, 
-        id: board.entityID
-      }
     end
     
     # ──────────────────────────────────────────────────────────────────
