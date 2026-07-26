@@ -809,6 +809,10 @@ module SU_MCP
         ents = e.is_a?(Sketchup::Group) ? e.entities : e.definition.entities
         faces = ents.grep(Sketchup::Face).length
         next if faces < 4   # a single face or two is deliberate, not a broken solid
+        # Flat by construction -- a pane, a decal, a cut-out outline. It was
+        # never going to be a solid, so calling it a broken one is just noise.
+        b = e.bounds
+        next if [b.width, b.height, b.depth].any? { |d| d.abs < 1e-6 }
         open_shells << { id: e.entityID,
                          name: (e.respond_to?(:name) ? e.name : ""),
                          faces: faces,
