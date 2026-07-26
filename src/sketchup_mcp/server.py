@@ -657,6 +657,41 @@ def create_dovetail(
     return _call(ctx, "create_dovetail", args)
 
 @mcp.tool()
+def check_model(ctx: Context, limit: int = 50, max_faces: int = 4000) -> str:
+    """Find modelling faults that measure correctly but render wrongly.
+
+    **coplanar overlaps** -- two faces on the same plane covering the same
+    area. The depth buffer has no way to order them, so the surface flickers
+    between its own colour and whatever is behind it as the camera moves.
+
+    SketchUp merges coplanar faces automatically WITHIN one context, so this
+    almost always happens ACROSS a container boundary: a wall inside a group,
+    and a rectangle drawn later as loose geometry on top of it. Nothing warns
+    you, and the model measures perfectly, so it shows up only as an artifact
+    on screen.
+
+    Fix by moving the stray geometry into the group -- cut it, double-click
+    into the group, Edit > Paste In Place -- so SketchUp can merge it. Or
+    delete whichever face is redundant.
+
+    **open shells** -- groups of several faces that do not close into a solid.
+    They report no volume and cannot take part in solid operations or export
+    cleanly.
+
+    Args:
+        limit:     maximum findings to return per category.
+        max_faces: stop after this many faces, for very large models.
+
+    The overlap test samples points across the region where two faces' bounds
+    meet; a point inside BOTH faces proves the same area is covered twice. It
+    can miss a very thin sliver, so a clean result is good evidence rather
+    than a proof.
+    """
+    return _call(ctx, "check_model", {"limit": limit, "max_faces": max_faces},
+                 timeout=LONG_TIMEOUT)
+
+
+@mcp.tool()
 def array_copy(ctx: Context, id: str, count: int, offset: List[float]) -> str:
     """Repeat an entity along a vector -- slats, pickets, balusters, shelves.
 
@@ -716,6 +751,7 @@ def create_text(
     facing: str = "+z",
     height: float = 5.0,
     depth: float = 0.3,
+    sink: float = 0.05,
     font: str = "Arial",
     bold: bool = False,
     italic: bool = False,
@@ -738,6 +774,11 @@ def create_text(
                   and a position on that wall.
         height:   cap height in centimetres.
         depth:    how far it stands proud of the surface, in centimetres.
+        sink:     how far the BACK face is bedded into the surface, in
+                  centimetres. Small on purpose: laid exactly flush, the
+                  letter's back face is coplanar with the wall, which makes
+                  the two flicker against each other as the camera moves.
+                  0 restores the flush placement and that artifact.
         font:     font name. Falls back with an error if not installed.
         bold, italic: font styling.
         name:     name for the resulting group.
@@ -755,7 +796,7 @@ def create_text(
     """
     args: Dict[str, Any] = {
         "text": text, "position": position, "facing": facing,
-        "height": height, "depth": depth, "font": font,
+        "height": height, "depth": depth, "sink": sink, "font": font,
         "bold": bold, "italic": italic,
     }
     if name is not None:
