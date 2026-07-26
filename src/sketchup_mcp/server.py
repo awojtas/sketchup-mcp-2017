@@ -657,6 +657,32 @@ def create_dovetail(
     return _call(ctx, "create_dovetail", args)
 
 @mcp.tool()
+def array_copy(ctx: Context, id: str, count: int, offset: List[float]) -> str:
+    """Repeat an entity along a vector -- slats, pickets, balusters, shelves.
+
+    This repeats a FINISHED entity, whatever it is: a board with a dovetail
+    already cut, a whole assembly, a component instance. Listing primitives
+    out with create_components would mean rebuilding the joinery on every one.
+
+    Args:
+        id:     entityID of the entity to repeat.
+        count:  total items in the finished array, INCLUDING the original --
+                count 12 adds 11 copies.
+        offset: [dx, dy, dz] in CENTIMETRES, the step from one item to the next.
+
+    Groups stay groups; component instances stay instances sharing their
+    definition. For a grid, run it again on one of the resulting ids.
+
+    Every copy's position is checked against where it should land before the
+    operation is committed, so a wrong step -- or one applied in inches --
+    fails rather than producing a plausible-looking array at the wrong pitch.
+    """
+    return _call(ctx, "array_copy",
+                 {"id": id, "count": count, "offset": offset},
+                 timeout=LONG_TIMEOUT)
+
+
+@mcp.tool()
 def create_components(ctx: Context, items: List[Dict[str, Any]]) -> str:
     """Create several primitives in one call and one undo step.
 
