@@ -126,7 +126,7 @@ Lengths at the tool boundary are **centimetres**. Raw Ruby in `eval_ruby` return
 
 ### Tools
 
-**Modelling** — `create_component`, `create_text` (raised lettering), `delete_component`, `transform_component`, `cut_pocket`, `solid_op`, `set_material`, `select`, `undo_last`
+**Modelling** — `create_component`, `create_components` (many in one undo step), `create_text` (raised lettering), `delete_component`, `transform_component`, `cut_pocket`, `solid_op`, `set_material`, `select`, `undo_last`
 
 **Joinery** — `create_dovetail`, `create_finger_joint`, `create_mortise_tenon`
 
