@@ -521,6 +521,8 @@ module SU_MCP
           create_components(args)
         when "array_copy"
           array_copy(args)
+        when "check_model"
+          check_model(args)
         when "eval_ruby"
           eval_ruby(args)
         when "batch"
@@ -636,6 +638,212 @@ module SU_MCP
         log "Sending error response: #{response.inspect}"
         response
       end
+    end
+
+    # ──────────────────────────────────────────────────────────────────
+    # Model checks
+    # ──────────────────────────────────────────────────────────────────
+    #
+    # Coplanar overlapping faces are the one worth having a tool for. Two
+    # faces on the same plane covering the same area give the depth buffer a
+    # tie to break, so which one draws changes as the camera moves: the
+    # surface flickers between its own colour and whatever is behind it.
+    #
+    # SketchUp merges coplanar faces automatically WITHIN one context, which
+    # is why this almost always happens ACROSS a container boundary -- a wall
+    # panel inside a group, and a rectangle drawn later as loose geometry on
+    # top of it. Nothing in the UI flags it, and the model measures perfectly
+    # well, so it is only visible as a rendering artifact.
+    #
+    # The overlap test samples points rather than intersecting polygons
+    # exactly: points are taken across the region where the two faces' bounds
+    # meet, and a point lying inside BOTH faces proves the same area is
+    # covered twice. That can miss a very thin sliver of overlap, so a clean
+    # result is good evidence rather than a proof.
+
+    # World-space plane, canonicalised so a plane and its flip share a key.
+    def canonical_plane(normal, point)
+      n = [normal.x, normal.y, normal.z]
+      # Fix the sign from the first component that is clearly non-zero, so an
+      # inward- and outward-facing pair of the same plane compare equal.
+      lead = n.index { |v| v.abs > 1e-9 }
+      return nil unless lead
+      n = n.map { |v| -v } if n[lead] < 0
+      d = -(n[0] * point.x + n[1] * point.y + n[2] * point.z)
+      [n, d]
+    end
+
+    # Two axes spanning the plane, for laying out sample points on it.
+    def plane_basis(normal)
+      helper = if normal.z.abs <= normal.x.abs && normal.z.abs <= normal.y.abs
+                 Geom::Vector3d.new(0, 0, 1)
+               else
+                 Geom::Vector3d.new(1, 0, 0)
+               end
+      u = normal.cross(helper)
+      u.normalize!
+      v = normal.cross(u)
+      v.normalize!
+      [u, v]
+    end
+
+    # Every face in the model with its world transform and container path.
+    def each_world_face(model)
+      found = []
+      walk = lambda do |entities, transform, path|
+        entities.each do |e|
+          if e.is_a?(Sketchup::Face)
+            found << { :face => e, :transform => transform, :path => path }
+          elsif e.is_a?(Sketchup::Group)
+            label = e.name.to_s.empty? ? "Group##{e.entityID}" : "#{e.name}##{e.entityID}"
+            walk.call(e.entities, transform * e.transformation, path + [label])
+          elsif e.is_a?(Sketchup::ComponentInstance)
+            label = e.definition.name.to_s.empty? ? "Instance##{e.entityID}" : "#{e.definition.name}##{e.entityID}"
+            walk.call(e.definition.entities, transform * e.transformation, path + [label])
+          end
+        end
+      end
+      walk.call(model.entities, Geom::Transformation.new, [])
+      found
+    end
+
+    # Do these two faces cover any of the same area? Sampled across the region
+    # where their bounds meet, which is the only place an overlap can be.
+    def faces_share_area?(a, b, normal, steps = 6)
+      lo = (0..2).map { |i| [a[:box].min.to_a[i], b[:box].min.to_a[i]].max }
+      hi = (0..2).map { |i| [a[:box].max.to_a[i], b[:box].max.to_a[i]].min }
+      return false if (0..2).any? { |i| hi[i] - lo[i] < -1e-6 }
+
+      u, v = plane_basis(normal)
+      corners = []
+      [lo[0], hi[0]].each { |x| [lo[1], hi[1]].each { |y| [lo[2], hi[2]].each { |z|
+        corners << Geom::Point3d.new(x, y, z) } } }
+      us = corners.map { |p| p.x * u.x + p.y * u.y + p.z * u.z }
+      vs = corners.map { |p| p.x * v.x + p.y * v.y + p.z * v.z }
+
+      # Anchor the sample grid on a point known to be on the plane.
+      anchor = a[:point]
+      au = anchor.x * u.x + anchor.y * u.y + anchor.z * u.z
+      av = anchor.x * v.x + anchor.y * v.y + anchor.z * v.z
+
+      inv_a = a[:transform].inverse
+      inv_b = b[:transform].inverse
+      inside = Sketchup::Face::PointInside
+
+      (0..steps).each do |i|
+        du = us.min + (us.max - us.min) * i / steps.to_f
+        (0..steps).each do |j|
+          dv = vs.min + (vs.max - vs.min) * j / steps.to_f
+          p = anchor.offset(u, du - au).offset(v, dv - av)
+          next unless a[:face].classify_point(p.transform(inv_a)) == inside
+          return true if b[:face].classify_point(p.transform(inv_b)) == inside
+        end
+      end
+      false
+    end
+
+    def check_model(params)
+      model = Sketchup.active_model
+      raise "No active model" unless model
+
+      reject_unknown_params!(params, %w[limit max_faces], "check_model")
+      limit = (params["limit"] || 50).to_i
+      max_faces = (params["max_faces"] || 4000).to_i
+
+      entries = each_world_face(model)
+      truncated_scan = entries.length > max_faces
+      entries = entries[0, max_faces] if truncated_scan
+
+      # Bucket by plane, so only faces that could possibly clash are compared.
+      buckets = {}
+      entries.each do |entry|
+        face = entry[:face]
+        verts = face.outer_loop.vertices
+        next if verts.length < 3
+        point = verts[0].position.transform(entry[:transform])
+        normal = face.normal.transform(entry[:transform])
+        next if normal.length == 0
+        normal.normalize!
+        plane = canonical_plane(normal, point)
+        next unless plane
+
+        key = [plane[0].map { |v| (v * 100).round }, (plane[1] * 100).round]
+        entry[:point]  = point
+        entry[:normal] = normal
+        box = Geom::BoundingBox.new
+        verts.each { |vv| box.add(vv.position.transform(entry[:transform])) }
+        entry[:box]  = box
+        entry[:area] = face.area * (2.54 ** 2)
+        (buckets[key] ||= []) << entry
+      end
+
+      overlaps = []
+      buckets.each_value do |group|
+        next if group.length < 2
+        group.each_with_index do |a, i|
+          ((i + 1)...group.length).each do |j|
+            b = group[j]
+            # Same container and sharing edges is normal; SketchUp would have
+            # merged a genuine duplicate there, so only real area counts.
+            next unless faces_share_area?(a, b, a[:normal])
+            overlaps << {
+              a: { id: a[:face].entityID, container: a[:path],
+                   area_cm2: a[:area].round(2),
+                   material: (a[:face].material ? a[:face].material.name : nil) },
+              b: { id: b[:face].entityID, container: b[:path],
+                   area_cm2: b[:area].round(2),
+                   material: (b[:face].material ? b[:face].material.name : nil) },
+              plane_cm: point_to_cm(a[:point]),
+              normal: [a[:normal].x.round(3), a[:normal].y.round(3), a[:normal].z.round(3)]
+            }
+          end
+        end
+      end
+
+      # Groups that look like solids but are not close up: the other thing
+      # that quietly breaks volume, boolean ops and export.
+      open_shells = []
+      model.entities.each do |e|
+        next unless e.is_a?(Sketchup::Group) || e.is_a?(Sketchup::ComponentInstance)
+        next if (e.manifold? rescue true)
+        ents = e.is_a?(Sketchup::Group) ? e.entities : e.definition.entities
+        faces = ents.grep(Sketchup::Face).length
+        next if faces < 4   # a single face or two is deliberate, not a broken solid
+        # Flat by construction -- a pane, a decal, a cut-out outline. It was
+        # never going to be a solid, so calling it a broken one is just noise.
+        b = e.bounds
+        next if [b.width, b.height, b.depth].any? { |d| d.abs < 1e-6 }
+        open_shells << { id: e.entityID,
+                         name: (e.respond_to?(:name) ? e.name : ""),
+                         faces: faces,
+                         bounds_cm: solid_stats(e)[:bounds_cm] }
+      end
+
+      {
+        success: true,
+        result: {
+          faces_scanned: entries.length,
+          scan_truncated: truncated_scan,
+          coplanar_overlaps: {
+            count: overlaps.length,
+            shown: [overlaps.length, limit].min,
+            note: "Two faces on the same plane covering the same area. The " \
+                  "depth buffer has no way to order them, so the surface " \
+                  "flickers between them as the camera moves. Usually one is " \
+                  "loose geometry drawn on top of a face inside a group. Fix " \
+                  "by deleting whichever is redundant, or by moving the " \
+                  "stray face into the group so SketchUp can merge it.",
+            pairs: overlaps[0, limit]
+          },
+          open_shells: {
+            count: open_shells.length,
+            note: "Groups with several faces that do not close into a solid. " \
+                  "They report no volume and cannot take part in solid " \
+                  "operations or a clean export.",
+            items: open_shells[0, limit]
+          }
+        }
+      }
     end
 
     # Repeat an entity along a vector -- slats, pickets, balusters, shelves,
@@ -2366,7 +2574,7 @@ module SU_MCP
       model = Sketchup.active_model
       raise "No active model" unless model
 
-      reject_unknown_params!(params, %w[text position facing height depth
+      reject_unknown_params!(params, %w[text position facing height depth sink
                                         font bold italic name], "create_text")
 
       text = params["text"].to_s
@@ -2384,6 +2592,12 @@ module SU_MCP
       raise "height must be greater than 0" unless height_cm > 0
       depth_cm = (params["depth"] || 0.3).to_f
       raise "depth must be greater than 0" unless depth_cm > 0
+
+      # Bedded this far into the surface so the back face is buried rather than
+      # coplanar with it. 0 restores the flush placement, which looks correct
+      # in every measurement and flickers on screen.
+      sink_cm = params.key?("sink") ? params["sink"].to_f : 0.05
+      raise "sink must be 0 or more" if sink_cm < 0
 
       position = params["position"] || [0.0, 0.0, 0.0]
       unless position.is_a?(Array) && position.length == 3
@@ -2415,7 +2629,10 @@ module SU_MCP
 
         built = group.entities.add_3d_text(
           text, TextAlignLeft, font, bold, italic,
-          height_cm / 2.54, 0.0, 0.0, true, depth_cm / 2.54)
+          height_cm / 2.54, 0.0, 0.0, true,
+          # Long enough to stand `depth` proud AND reach `sink` behind the
+          # surface, so the back face is buried rather than coplanar with it.
+          (depth_cm + sink_cm) / 2.54)
 
         unless built && group.entities.grep(Sketchup::Face).length > 0
           raise "SketchUp could not build 3D text for #{text.inspect} in font " \
@@ -2425,30 +2642,39 @@ module SU_MCP
         # add_3d_text lays the glyphs in the XY plane extruded along +Z. Move
         # that frame onto the surface: reading along `right`, up along `up`,
         # and growing outward along `facing`, with the glyphs centred on the
-        # requested point and their backs on the surface.
+        # requested point.
+        #
+        # The back face is bedded slightly INTO the surface rather than laid
+        # flush on it. Flush means two faces on one plane covering the same
+        # area, which gives the depth buffer a tie to break -- so the lettering
+        # flickers against the wall as the camera moves. Burying the back face
+        # removes the tie. It is the same defect check_model looks for, and
+        # this tool used to create one every time it ran.
         b = group.bounds
         cx = (b.min.x + b.max.x) / 2.0
         cy = (b.min.y + b.max.y) / 2.0
         px = position[0].to_f / 2.54
         py = position[1].to_f / 2.54
         pz = position[2].to_f / 2.54
+        back = -sink_cm / 2.54   # along `facing`, so negative is into the surface
 
-        origin = Geom::Point3d.new(px - cx * right.x - cy * up.x,
-                                   py - cx * right.y - cy * up.y,
-                                   pz - cx * right.z - cy * up.z)
+        origin = Geom::Point3d.new(px - cx * right.x - cy * up.x + back * facing.x,
+                                   py - cx * right.y - cy * up.y + back * facing.y,
+                                   pz - cx * right.z - cy * up.z + back * facing.z)
         group.transformation = Geom::Transformation.axes(origin, right, up, facing)
 
         stats = solid_stats(group)
 
-        # The lettering must sit ON the surface and grow outward from it, not
-        # straddle it or sink in. Check along the facing axis, where the
-        # expected span is exactly [position, position + depth].
+        # The lettering must stand proud of the surface by `depth` and reach
+        # `sink` behind it -- not straddle the surface the wrong way round, and
+        # not sit flush.
         axis = normal.index { |v| v != 0.0 }
         sign = normal[axis]
         near_face = stats[:bounds_cm][:min][axis]
         far_face  = stats[:bounds_cm][:max][axis]
-        lo = sign > 0 ? position[axis].to_f : position[axis].to_f - depth_cm
-        hi = sign > 0 ? position[axis].to_f + depth_cm : position[axis].to_f
+        at = position[axis].to_f
+        lo = sign > 0 ? at - sink_cm : at - depth_cm
+        hi = sign > 0 ? at + depth_cm : at + sink_cm
         if (near_face - lo).abs > 0.01 || (far_face - hi).abs > 0.01
           raise "The lettering did not land on the surface: it spans " \
                 "#{near_face.round(2)}..#{far_face.round(2)} cm on " \
@@ -2468,6 +2694,7 @@ module SU_MCP
             facing: key,
             height_cm: height_cm,
             depth_cm: depth_cm,
+            sink_cm: sink_cm,
             font: font,
             solid: stats[:manifold],
             volume_cm3: stats[:volume_cm3],

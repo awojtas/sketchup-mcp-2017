@@ -130,7 +130,7 @@ Lengths at the tool boundary are **centimetres**. Raw Ruby in `eval_ruby` return
 
 **Joinery** — `create_dovetail`, `create_finger_joint`, `create_mortise_tenon`
 
-**Inspection** — `get_selection`, `measure`, `list_definitions`, `list_instances`, `units_info`, `snapshot` (returns the render itself, so an agent can look at its work)
+**Inspection** — `check_model` (finds faults that measure right but render wrong), `get_selection`, `measure`, `list_definitions`, `list_instances`, `units_info`, `snapshot` (returns the render itself, so an agent can look at its work)
 
 **Other** — `export_scene`, `eval_ruby` (arbitrary Ruby in SketchUp), `batch` (several calls in one undo step), `transaction`, `ping`
 
