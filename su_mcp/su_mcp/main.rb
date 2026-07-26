@@ -499,6 +499,8 @@ module SU_MCP
           set_material(args)
         when "boolean_operation"
           boolean_operation(args)
+        when "cut_pocket"
+          cut_pocket(args)
         when "chamfer_edges"
           chamfer_edges(args)
         when "fillet_edges"
@@ -1131,41 +1133,91 @@ module SU_MCP
       end
     end
     
-    # Subtract +cutter_group+ from +solid_group+, returning the resulting group.
+    # Push a face into the solid it sits on.
     #
-    # The joinery tools all called Sketchup::Entities#subtract, which does not
-    # exist -- Entities only has intersect_with, which scribes intersection
-    # edges and removes nothing. Confirmed on SketchUp 2017:
-    #   Sketchup::Entities.instance_methods.grep(/subtract/) => []
-    #   Sketchup::Group.instance_methods.grep(/subtract/)    => [:subtract]
+    # Which sign cuts inward depends on the face's winding order, which is not
+    # something to reason about per orientation branch. Decide from geometry
+    # instead: if the face normal points toward the middle of the surrounding
+    # geometry, a positive push goes inward.
     #
-    # Solid ops also consume BOTH operands and return a NEW group, so the
-    # result has to be captured; anything still holding the original is holding
-    # a deleted entity.
-    def subtract_solid(solid_group, cutter_group, label)
-      unless solid_tools_available?
-        raise "#{label} needs solid operations, which are a SketchUp Pro " \
-              "feature and are absent from Make. This joint cannot be cut " \
-              "automatically in this edition."
+    # Everything here is in the group's local coordinates, so no transform is
+    # involved.
+    def pushpull_into(face, entities, depth_inches)
+      box = Geom::BoundingBox.new
+      entities.each { |e| box.add(e.bounds) if e.respond_to?(:bounds) }
+
+      toward_middle = face.bounds.center.vector_to(box.center)
+      inward = if toward_middle.length > 0 && (face.normal % toward_middle) < 0
+                 -1.0
+               else
+                 1.0
+               end
+
+      face.pushpull(depth_inches * inward)
+    end
+
+    # Cut a prismatic pocket into a solid by drawing a profile on one of its
+    # faces and pushing inward -- exactly the gesture a person uses in SketchUp.
+    #
+    # This is the non-Pro path for material removal. Solid operations
+    # (solid_op) are a Pro feature, but the great majority of real cuts --
+    # mortises, notches, rebates, slots, holes -- are a flat profile extruded
+    # into a face, which push/pull does natively on every edition.
+    #
+    # Only handles prismatic cuts from a planar face. Anything needing genuine
+    # CSG (cutting with an arbitrary solid, angled or curved intersections)
+    # still needs solid_op and therefore Pro.
+    def cut_pocket(params)
+      model = Sketchup.active_model
+      raise "No active model" unless model
+
+      target = resolve_solid(model, params["id"], "target")
+      points = params["points"]
+      unless points.is_a?(Array) && points.length >= 3
+        raise "points must be an array of at least 3 [x, y, z] coordinates in cm, " \
+              "describing a closed profile lying on one face of the solid"
       end
 
-      # Operand order, confirmed empirically on SketchUp 2017 with
-      # differently-sized solids (10cm cube vs 20cm cube, 125cm3 overlap):
-      #
-      #   A.subtract(B) -> 7875 = B - overlap, and the result inherits B's bounds
-      #   B.subtract(A) ->  875 = A - overlap, inheriting A's bounds
-      #
-      # So the RECEIVER is the cutter and the ARGUMENT is what survives. It
-      # reads backwards. Written the intuitive way round, this would silently
-      # keep the cutter and discard the workpiece.
-      result = cutter_group.subtract(solid_group)
+      depth_cm = params["depth"].to_f
+      raise "depth must be greater than 0" unless depth_cm > 0
 
-      if result.nil? || !result.valid?
-        raise "#{label}: the cut produced no result. The shapes may not " \
-              "overlap, or one of them may not be a manifold solid."
+      entities = target.is_a?(Sketchup::Group) ? target.entities : target.definition.entities
+      before = solid_stats(target)
+
+      # Caller works in centimetres; SketchUp geometry is inches.
+      pts = points.map { |p| Geom::Point3d.new(p[0].to_f / 2.54, p[1].to_f / 2.54, p[2].to_f / 2.54) }
+
+      face = entities.add_face(pts)
+      raise "Could not create a face from those points -- they must be coplanar " \
+            "and describe a non-degenerate profile" unless face
+
+      pushpull_into(face, entities, depth_cm / 2.54)
+
+      after = solid_stats(target)
+
+      unless after[:manifold]
+        raise "The cut left the solid non-manifold. The profile probably does " \
+              "not lie flat on a single face, or the depth passes through the " \
+              "far side. Use undo_last to revert."
       end
 
-      result
+      if before[:volume_cm3] && after[:volume_cm3] && after[:volume_cm3] >= before[:volume_cm3]
+        raise "The cut removed no material (#{before[:volume_cm3].round(1)} -> " \
+              "#{after[:volume_cm3].round(1)} cm3). The profile may be off the " \
+              "surface, or the push went outward. Use undo_last to revert."
+      end
+
+      {
+        success: true,
+        result: {
+          id: target.entityID,
+          depth_cm: depth_cm,
+          removed_cm3: (before[:volume_cm3] && after[:volume_cm3] ?
+                        (before[:volume_cm3] - after[:volume_cm3]).round(3) : nil),
+          before: before,
+          after: after
+        }
+      }
     end
 
     # Solid (boolean) operations.
@@ -1718,44 +1770,44 @@ module SU_MCP
       
       log "Creating mortise at position: #{mortise_position.inspect} with dimensions: #{[width, height, depth].inspect}"
       
-      # Create a box for the mortise
-      mortise_group = entities.add_group
+      # Draw the mortise profile directly on the board and push it inward --
+      # the same gesture a person uses, and it works on every SketchUp edition.
+      # The previous approach built a separate box and subtracted it, which
+      # needs the Pro-only solid tools for a cut that does not require them.
+      mortise_group = nil
       
       # Create the mortise box with the correct orientation
       case face_direction
       when :east, :west
         # Mortise on east or west face (YZ plane)
-        mortise_face = mortise_group.entities.add_face(
+        mortise_face = entities.add_face(
           [mortise_position[0], mortise_position[1], mortise_position[2]],
           [mortise_position[0], mortise_position[1] + width, mortise_position[2]],
           [mortise_position[0], mortise_position[1] + width, mortise_position[2] + height],
           [mortise_position[0], mortise_position[1], mortise_position[2] + height]
         )
-        mortise_face.pushpull(face_direction == :east ? -depth : depth)
+        pushpull_into(mortise_face, entities, depth)
       when :north, :south
         # Mortise on north or south face (XZ plane)
-        mortise_face = mortise_group.entities.add_face(
+        mortise_face = entities.add_face(
           [mortise_position[0], mortise_position[1], mortise_position[2]],
           [mortise_position[0] + width, mortise_position[1], mortise_position[2]],
           [mortise_position[0] + width, mortise_position[1], mortise_position[2] + height],
           [mortise_position[0], mortise_position[1], mortise_position[2] + height]
         )
-        mortise_face.pushpull(face_direction == :north ? -depth : depth)
+        pushpull_into(mortise_face, entities, depth)
       when :top, :bottom
         # Mortise on top or bottom face (XY plane)
-        mortise_face = mortise_group.entities.add_face(
+        mortise_face = entities.add_face(
           [mortise_position[0], mortise_position[1], mortise_position[2]],
           [mortise_position[0] + width, mortise_position[1], mortise_position[2]],
           [mortise_position[0] + width, mortise_position[1] + height, mortise_position[2]],
           [mortise_position[0], mortise_position[1] + height, mortise_position[2]]
         )
-        mortise_face.pushpull(face_direction == :top ? -depth : depth)
+        pushpull_into(mortise_face, entities, depth)
       end
       
-      # Subtract the mortise from the board. Captures the returned group:
-      # the operands are consumed, so the original board is dead after this.
-      board = subtract_solid(board, mortise_group, "create_mortise_tenon")
-      entities = board.entities
+      # Nothing to subtract: pushing the profile inward removed the material.
       
       # Clean up the temporary group
       mortise_group.erase!
@@ -1974,7 +2026,7 @@ module SU_MCP
         tail_face = tails_group.entities.add_face(tail_points)
         
         # Extrude the tail
-        tail_face.pushpull(height)
+        pushpull_into(tail_face, pins_group.entities, height)
       end
       
       # Return the result
@@ -2027,7 +2079,7 @@ module SU_MCP
         tail_bottom_width = tail_width + 2 * depth * Math.tan(angle_rad)
         
         # Create a group for the tail cutout
-        tail_cutout_group = entities.add_group
+        # Drawn straight onto the pin block and pushed through -- no solid op.
         
         # Create the tail cutout shape
         tail_points = [
@@ -2038,16 +2090,12 @@ module SU_MCP
         ]
         
         # Create the tail cutout face
-        tail_face = tail_cutout_group.entities.add_face(tail_points)
+        tail_face = pins_group.entities.add_face(tail_points)
         
         # Extrude the tail cutout
-        tail_face.pushpull(height)
+        pushpull_into(tail_face, pins_group.entities, height)
         
-        # Subtract the tail cutout from the pin area
-        pins_group = subtract_solid(pins_group, tail_cutout_group, "create_dovetail")
-        
-        # Clean up the temporary group
-        tail_cutout_group.erase!
+        # The push already removed the material; nothing to subtract.
       end
       
       # Return the result
@@ -2141,10 +2189,10 @@ module SU_MCP
         cutout_center_x = center_x - width/2 + finger_width * (2 * i + 1)
         
         # Create a group for the cutout
-        cutout_group = entities.add_group
+        # Drawn onto the workpiece and pushed through -- no solid op.
         
         # Create the cutout shape
-        cutout_face = cutout_group.entities.add_face(
+        cutout_face = fingers_group.entities.add_face(
           [cutout_center_x - finger_width/2, center_y - height/2, center_z],
           [cutout_center_x + finger_width/2, center_y - height/2, center_z],
           [cutout_center_x + finger_width/2, center_y + height/2, center_z],
@@ -2152,13 +2200,9 @@ module SU_MCP
         )
         
         # Extrude the cutout
-        cutout_face.pushpull(depth)
+        pushpull_into(cutout_face, fingers_group.entities, depth)
         
-        # Subtract the cutout from the fingers
-        fingers_group = subtract_solid(fingers_group, cutout_group, "create_finger_joint")
-        
-        # Clean up the temporary group
-        cutout_group.erase!
+        # The push already removed the material; nothing to subtract.
       end
       
       # Extrude the fingers
@@ -2197,10 +2241,10 @@ module SU_MCP
         cutout_center_x = center_x - width/2 + finger_width * (2 * i)
         
         # Create a group for the cutout
-        cutout_group = entities.add_group
+        # Drawn onto the workpiece and pushed through -- no solid op.
         
         # Create the cutout shape
-        cutout_face = cutout_group.entities.add_face(
+        cutout_face = entities.add_face(
           [cutout_center_x - finger_width/2, center_y - height/2, center_z],
           [cutout_center_x + finger_width/2, center_y - height/2, center_z],
           [cutout_center_x + finger_width/2, center_y + height/2, center_z],
@@ -2208,14 +2252,9 @@ module SU_MCP
         )
         
         # Extrude the cutout
-        cutout_face.pushpull(depth)
+        pushpull_into(cutout_face, entities, depth)
         
-        # Subtract the cutout from the board
-        board = subtract_solid(board, cutout_group, "create_finger_joint")
-        entities = board.entities
-        
-        # Clean up the temporary group
-        cutout_group.erase!
+        # The push already removed the material; nothing to subtract.
       end
       
       # Return the result

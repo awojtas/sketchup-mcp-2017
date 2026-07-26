@@ -131,8 +131,17 @@ lsof -nP -iTCP:9876 -sTCP:LISTEN
 #### Claude Code
 
 ```bash
-claude mcp add sketchup -- uvx --from git+https://github.com/awojtas/sketchup-mcp-2017 sketchup-mcp
+uv tool install git+https://github.com/awojtas/sketchup-mcp-2017
+claude mcp add sketchup -- sketchup-mcp
 ```
+
+Install once, then start it directly. `uvx --from git+...` also works, but it
+re-resolves and re-fetches from git on **every** start — measurably slower, and
+on Windows it can take long enough that Claude times out waiting. To update
+later: `uv tool upgrade sketchup-mcp`, or re-run the install with `--force`.
+
+If startup still times out, raise Claude Code's limit with `MCP_TIMEOUT`
+(milliseconds), e.g. `MCP_TIMEOUT=60000`.
 
 Then `/mcp` inside Claude Code to confirm. This is a one-off — from then on Claude Code launches the client itself whenever it needs it.
 
