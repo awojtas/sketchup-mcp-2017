@@ -394,15 +394,32 @@ def transform_component(
     ctx: Context,
     id: str,
     position: List[float] = None,
+    translate: List[float] = None,
     rotation: List[float] = None,
     scale: List[float] = None
 ) -> str:
-    """Transform a component's position, rotation, or scale"""
+    """Move, rotate or scale a component.
+
+    Args:
+        id:        entityID of the entity to transform.
+        position:  ABSOLUTE destination [x, y, z] in CENTIMETRES. Moves the
+                   entity so its origin lands here, matching the position_cm
+                   that measure reports.
+        translate: RELATIVE offset [dx, dy, dz] in CENTIMETRES.
+        rotation:  [rx, ry, rz] in degrees, about the entity's bounds centre.
+        scale:     [sx, sy, sz] multipliers.
+
+    Pass position or translate, not both. Lengths are centimetres -- these
+    were previously interpreted as inches, so asking to move 10 moved 25.4,
+    and "position" silently behaved as a relative offset that accumulated.
+    """
     try:
         sketchup = get_sketchup_connection()
         arguments = {"id": id}
         if position is not None:
             arguments["position"] = position
+        if translate is not None:
+            arguments["translate"] = translate
         if rotation is not None:
             arguments["rotation"] = rotation
         if scale is not None:

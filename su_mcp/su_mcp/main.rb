@@ -870,14 +870,40 @@ module SU_MCP
       if entity
         log "Found entity: #{entity.inspect}"
         
-        # Handle position
-        if params["position"]
+        # Position. Two defects were fixed here, both silent:
+        #
+        # 1. Values were passed straight to Geom::Point3d, which takes inches,
+        #    while the boundary is centimetres. Asking to move 10 moved 25.4.
+        # 2. Geom::Transformation.translation is a RELATIVE offset, but the
+        #    argument is called "position" and measure reports "position_cm",
+        #    so callers reasonably read it as absolute. It silently accumulated.
+        #
+        # Both meanings are now available and named for what they do. "position"
+        # is absolute, matching measure's position_cm (the transformation
+        # origin); "translate" is a relative offset.
+        if params["position"] && params["translate"]
+          raise "Pass either position (absolute) or translate (relative), not both"
+        end
+
+        before_origin = entity.respond_to?(:transformation) ? entity.transformation.origin : nil
+
+        if params["translate"]
+          delta = params["translate"]
+          offset = Geom::Vector3d.new(delta[0].to_f / 2.54, delta[1].to_f / 2.54, delta[2].to_f / 2.54)
+          log "Translating by #{delta.inspect} cm"
+          entity.transform!(Geom::Transformation.translation(offset))
+
+        elsif params["position"]
           pos = params["position"]
-          log "Transforming position to #{pos.inspect}"
-          
-          # Create a transformation to move the entity
-          translation = Geom::Transformation.translation(Geom::Point3d.new(pos[0], pos[1], pos[2]))
-          entity.transform!(translation)
+          target = Geom::Point3d.new(pos[0].to_f / 2.54, pos[1].to_f / 2.54, pos[2].to_f / 2.54)
+          log "Moving to absolute position #{pos.inspect} cm"
+
+          unless before_origin
+            raise "This entity has no transformation, so it cannot be positioned " \
+                  "absolutely. Use translate instead."
+          end
+
+          entity.transform!(Geom::Transformation.translation(target - before_origin))
         end
         
         # Handle rotation (in degrees)
@@ -1262,13 +1288,13 @@ module SU_MCP
       unless after[:manifold]
         raise "The cut left the solid non-manifold. The profile probably does " \
               "not lie flat on a single face, or the depth passes through the " \
-              "far side. Use undo_last to revert."
+              "far side. The model was left unchanged."
       end
 
       if before[:volume_cm3] && after[:volume_cm3] && after[:volume_cm3] >= before[:volume_cm3]
         raise "The cut removed no material (#{before[:volume_cm3].round(1)} -> " \
-              "#{after[:volume_cm3].round(1)} cm3). The profile may be off the " \
-              "surface, or the push went outward. Use undo_last to revert."
+              "#{after[:volume_cm3].round(1)} cm3). The profile is probably not " \
+              "lying on the face you meant. The model was left unchanged."
       end
 
       model.commit_operation
@@ -1319,16 +1345,23 @@ module SU_MCP
       end
 
       unless solid_tools_available?
-        raise "Solid operations are not available in this SketchUp edition. " \
-              "They are a SketchUp Pro feature and are absent from Make. " \
-              "Alternatives: cut the shape interactively with the Solid Tools " \
-              "in SketchUp, or build the geometry so the cut is not needed " \
-              "(draw the profile you want and push/pull it, rather than " \
-              "subtracting one solid from another)."
+        raise "Solid operations are not available in this SketchUp edition -- " \
+              "they are a SketchUp Pro feature, absent from Make. " \
+              "Use cut_pocket instead: give it a profile on a face of the " \
+              "solid and a depth, and it removes the material by push/pull, " \
+              "which works on every edition. That covers prismatic cuts -- " \
+              "mortises, notches, rebates, slots, holes -- which is most of " \
+              "them. Only genuinely non-prismatic cutting needs Pro."
       end
 
       before      = solid_stats(target)
       tool_before = solid_stats(tool)
+
+      # Solid ops consume both operands, and the checks below can reject the
+      # result after the fact. Without a wrapper that rejection leaves the
+      # model mangled -- the same defect cut_pocket had.
+      model.start_operation("MCP solid_op", true)
+      committed = false
 
       unless before[:manifold]
         raise "target ##{target.entityID} is not a manifold solid, so the result " \
@@ -1377,7 +1410,7 @@ module SU_MCP
           raise "subtract produced a solid LARGER than the target " \
                 "(target was #{before[:volume_cm3].round(1)} cm3, result is " \
                 "#{after[:volume_cm3].round(1)} cm3). The wrong operand survived. " \
-                "The model has changed -- use undo_last before retrying."
+                "The model was left unchanged."
         end
 
         # Only meaningful when the two solids differ in size; with equal volumes
@@ -1388,10 +1421,13 @@ module SU_MCP
                 "(target #{before[:volume_cm3].round(1)} cm3, tool " \
                 "#{tool_before[:volume_cm3].round(1)} cm3, result " \
                 "#{after[:volume_cm3].round(1)} cm3). The model has changed -- " \
-                "use undo_last before retrying, and report this: it means the " \
+                "the model was left unchanged. Report this: it means the " \
                 "operand order in boolean_operation is wrong for this SketchUp build."
         end
       end
+
+      model.commit_operation
+      committed = true
 
       {
         success: true,
@@ -1403,6 +1439,10 @@ module SU_MCP
           tool_kept: params["keep_tool"] ? true : false
         }
       }
+    ensure
+      if !committed && model && model.respond_to?(:abort_operation)
+        model.abort_operation rescue nil
+      end
     end
 
     # Solid operations are a SketchUp Pro feature. Checking for the method is
