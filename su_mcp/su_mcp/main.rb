@@ -1143,12 +1143,22 @@ module SU_MCP
     # result has to be captured; anything still holding the original is holding
     # a deleted entity.
     def subtract_solid(solid_group, cutter_group, label)
-      unless solid_group.respond_to?(:subtract)
+      unless solid_tools_available?
         raise "#{label} needs solid operations, which are a SketchUp Pro " \
-              "feature and are not available in this edition."
+              "feature and are absent from Make. This joint cannot be cut " \
+              "automatically in this edition."
       end
 
-      result = solid_group.subtract(cutter_group)
+      # Operand order, confirmed empirically on SketchUp 2017 with
+      # differently-sized solids (10cm cube vs 20cm cube, 125cm3 overlap):
+      #
+      #   A.subtract(B) -> 7875 = B - overlap, and the result inherits B's bounds
+      #   B.subtract(A) ->  875 = A - overlap, inheriting A's bounds
+      #
+      # So the RECEIVER is the cutter and the ARGUMENT is what survives. It
+      # reads backwards. Written the intuitive way round, this would silently
+      # keep the cutter and discard the workpiece.
+      result = cutter_group.subtract(solid_group)
 
       if result.nil? || !result.valid?
         raise "#{label}: the cut produced no result. The shapes may not " \
@@ -1183,9 +1193,13 @@ module SU_MCP
         raise "target_id and tool_id are the same entity (#{target.entityID})"
       end
 
-      unless target.respond_to?(:subtract) && target.respond_to?(:union)
+      unless solid_tools_available?
         raise "Solid operations are not available in this SketchUp edition. " \
-              "They are a SketchUp Pro feature; this appears to be Make."
+              "They are a SketchUp Pro feature and are absent from Make. " \
+              "Alternatives: cut the shape interactively with the Solid Tools " \
+              "in SketchUp, or build the geometry so the cut is not needed " \
+              "(draw the profile you want and push/pull it, rather than " \
+              "subtracting one solid from another)."
       end
 
       before      = solid_stats(target)
@@ -1204,7 +1218,9 @@ module SU_MCP
       # to survive, so "keep_tool" does not depend on operand order.
       operand = params["keep_tool"] ? tool.copy : tool
 
-      # The receiver is the cutter -- see the note above.
+      # The receiver is the cutter, the argument survives. Confirmed on
+      # SketchUp 2017: a 10cm cube subtract a 20cm cube (125cm3 overlap)
+      # returns 7875cm3, i.e. the argument minus the overlap.
       result = case operation
                when "subtract"  then operand.subtract(target)
                when "union"     then operand.union(target)
@@ -1268,6 +1284,10 @@ module SU_MCP
     # more reliable than is_pro?, which reports entitlement rather than what is
     # actually callable.
     def solid_tools_available?
+      # Lets the Make/non-Pro path be exercised on a Pro (or trial) install,
+      # rather than waiting for a licence to lapse to find out what breaks.
+      return false if ENV['SKETCHUP_MCP_NO_SOLID_TOOLS'] == '1'
+
       Sketchup::Group.instance_methods.include?(:subtract) &&
         Sketchup::Group.instance_methods.include?(:union)
     rescue StandardError
