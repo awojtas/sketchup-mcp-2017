@@ -112,8 +112,16 @@ def volume(c, eid):
     )
 
 
-def clear(c):
-    c.ruby("Sketchup.active_model.active_entities.to_a.each { |e| e.erase! if e.valid? }; nil")
+def erase(c, ids):
+    """Remove only the boards this script made.
+
+    An earlier version wiped active_entities instead, which would have
+    destroyed whatever the user had open. Test fixtures clean up after
+    themselves; they do not clear the workspace.
+    """
+    for eid in ids:
+        c.ruby(f"e = Sketchup.active_model.find_entity_by_id({eid}); "
+               "e.erase! if e && e.valid?; nil")
 
 
 def payload_for(args, ids):
@@ -126,42 +134,46 @@ def payload_for(args, ids):
 
 def joint_case(c, label, tool, boards, args, expected_removed, overlap_cm3):
     """Build boards, cut the joint, and check both boards and the identity."""
-    clear(c)
     ids = [board(c, *b) for b in boards]
-    before = [volume(c, i) for i in ids]
     try:
-        c.call(tool, payload_for(args, ids))
-    except Failure as e:
-        check(f"{label}: joint cut", False, str(e)[:160])
-        return
-    after = [volume(c, i) for i in ids]
+        before = [volume(c, i) for i in ids]
+        try:
+            c.call(tool, payload_for(args, ids))
+        except Failure as e:
+            check(f"{label}: joint cut", False, str(e)[:160])
+            return
+        after = [volume(c, i) for i in ids]
 
-    for i, want in enumerate(expected_removed):
-        got = None if after[i] is None else before[i] - after[i]
-        check(f"{label}: board {i} removes {want} cm3", near(got, want),
-              f"got {got}")
-    check(f"{label}: both boards still manifold", all(v is not None for v in after),
-          f"volumes {after}")
-    if all(v is not None for v in after):
-        expect = before[0] + before[1] - overlap_cm3
-        check(f"{label}: halves fill the overlap exactly once",
-              near(sum(after), expect), f"{sum(after):.3f} vs {expect:.3f}")
+        for i, want in enumerate(expected_removed):
+            got = None if after[i] is None else before[i] - after[i]
+            check(f"{label}: board {i} removes {want} cm3", near(got, want),
+                  f"got {got}")
+        check(f"{label}: both boards still manifold",
+              all(v is not None for v in after), f"volumes {after}")
+        if all(v is not None for v in after):
+            expect = before[0] + before[1] - overlap_cm3
+            check(f"{label}: halves fill the overlap exactly once",
+                  near(sum(after), expect), f"{sum(after):.3f} vs {expect:.3f}")
+    finally:
+        erase(c, ids)
 
 
 def reject_case(c, label, tool, boards, args):
     """The call must fail AND leave both boards exactly as they were."""
-    clear(c)
     ids = [board(c, *b) for b in boards]
-    before = [volume(c, i) for i in ids]
     try:
-        c.call(tool, payload_for(args, ids))
-        check(f"{label}: rejected", False, "call succeeded but should not have")
-        return
-    except Failure:
-        check(f"{label}: rejected", True)
-    after = [volume(c, i) for i in ids]
-    check(f"{label}: both boards left untouched", before == after,
-          f"{before} -> {after}")
+        before = [volume(c, i) for i in ids]
+        try:
+            c.call(tool, payload_for(args, ids))
+            check(f"{label}: rejected", False, "call succeeded but should not have")
+            return
+        except Failure:
+            check(f"{label}: rejected", True)
+        after = [volume(c, i) for i in ids]
+        check(f"{label}: both boards left untouched", before == after,
+              f"{before} -> {after}")
+    finally:
+        erase(c, ids)
 
 
 def main():
@@ -173,7 +185,13 @@ def main():
         return 2
 
     ver = c.call("ping")["version"]
-    print(f"Connected to extension v{ver}\n")
+    print(f"Connected to extension v{ver}")
+
+    # Each case erases only the boards it made, so this is safe to run against
+    # whatever happens to be open. The test boards are separate groups and
+    # never interact with existing geometry.
+    before_count = c.ruby("Sketchup.active_model.active_entities.length")
+    print(f"Model has {before_count} entities; test boards are added and removed.\n")
 
     print("finger joint")
     # Two 20x10x2 boards overlapping 2 cm; 5 fingers of 2 cm across the width.
@@ -213,31 +231,38 @@ def main():
                 {"_ids": ["board1_id", "board2_id"]})
     # Both ids pointing at one board: the tool must notice rather than cut it
     # twice and call the result a joint.
-    clear(c)
     dup = board(c, 0, 0, 0, 20, 10, 2)
-    dup_before = volume(c, dup)
     try:
-        c.call("create_finger_joint", {"board1_id": str(dup), "board2_id": str(dup)})
-        check("the same board given twice: rejected", False, "call succeeded")
-    except Failure:
-        check("the same board given twice: rejected", True)
-    check("the same board given twice: board left untouched",
-          volume(c, dup) == dup_before)
+        dup_before = volume(c, dup)
+        try:
+            c.call("create_finger_joint", {"board1_id": str(dup), "board2_id": str(dup)})
+            check("the same board given twice: rejected", False, "call succeeded")
+        except Failure:
+            check("the same board given twice: rejected", True)
+        check("the same board given twice: board left untouched",
+              volume(c, dup) == dup_before)
+    finally:
+        erase(c, [dup])
 
     print("\ncut_pocket world coordinates")
-    clear(c)
-    # A board away from the origin: a profile in the coordinates measure
-    # reports must cut it, not miss it and extrude a detached slab.
+    # A board away from the origin, with a non-identity transform: a profile
+    # in the coordinates measure reports must cut it, not miss it and extrude
+    # a detached slab.
     eid = board(c, 20, 5, 3, 10, 10, 2)
-    before = volume(c, eid)
-    c.call("cut_pocket", {"id": eid,
-                          "points": [[22, 7, 5], [28, 7, 5], [28, 12, 5], [22, 12, 5]],
-                          "depth": 1.0})
-    after = volume(c, eid)
-    check("cut_pocket: profile in world coordinates removes 30 cm3",
-          near(before - after if after else None, 30.0), f"{before} -> {after}")
+    try:
+        before = volume(c, eid)
+        c.call("cut_pocket", {"id": eid,
+                              "points": [[22, 7, 5], [28, 7, 5], [28, 12, 5], [22, 12, 5]],
+                              "depth": 1.0})
+        after = volume(c, eid)
+        check("cut_pocket: profile in world coordinates removes 30 cm3",
+              near(before - after if after else None, 30.0), f"{before} -> {after}")
+    finally:
+        erase(c, [eid])
 
-    clear(c)
+    left = c.ruby("Sketchup.active_model.active_entities.length")
+    check("the model is left as it was found", left == before_count,
+          f"{before_count} entities before, {left} after")
     print()
     if FAIL:
         print(f"{len(FAIL)} FAILED, {len(PASS)} passed")
