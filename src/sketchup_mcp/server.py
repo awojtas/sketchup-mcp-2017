@@ -325,9 +325,21 @@ def create_component(
     ctx: Context,
     type: str = "cube",
     position: List[float] = None,
-    dimensions: List[float] = None
+    dimensions: List[float] = None,
+    units: str = "cm"
 ) -> str:
-    """Create a new component in Sketchup"""
+    """Create a primitive component in SketchUp.
+
+    Args:
+        type:       "cube", "cylinder", "sphere" or "cone".
+        position:   [x, y, z] of the base corner/centre, in CENTIMETRES.
+        dimensions: [x, y, z] extents, in CENTIMETRES.
+        units:      "cm" (default) or "in" to supply SketchUp internal units.
+
+    Solids are built UPWARD from the given z. Lengths are centimetres unless
+    units is "in" -- these were previously passed through as inches, so a
+    requested 10cm cube came out 25.4cm with no error.
+    """
     try:
         logger.info(f"create_component called with type={type}, position={position}, dimensions={dimensions}, request_id={ctx.request_id}")
         
@@ -338,7 +350,8 @@ def create_component(
             "arguments": {
                 "type": type,
                 "position": position or [0,0,0],
-                "dimensions": dimensions or [1,1,1]
+                "dimensions": dimensions or [1,1,1],
+                "units": units
             }
         }
         

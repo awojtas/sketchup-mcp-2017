@@ -482,7 +482,10 @@ module SU_MCP
       # on purpose: when a call hangs -- SketchUp's own STL exporter blocks the
       # UI thread indefinitely -- the last line in the console names the call
       # that did it.
-      info "tool: #{tool_name}#{summarise_args(args)}"
+      # Log the name the caller used. boolean_operation is exposed as solid_op,
+      # so logging the internal name made the log ungreppable by tool name.
+      public_name = (tool_name == "boolean_operation") ? "solid_op" : tool_name
+      info "tool: #{public_name}#{summarise_args(args)}"
 
       begin
         result = case tool_name
@@ -640,6 +643,7 @@ module SU_MCP
       # inches. This was passing values through raw, so asking for a 10cm cube
       # produced a 25.4cm one -- no error, and dimensionally plausible enough to
       # go unnoticed. Pass units: "in" to supply SketchUp internal units.
+      reject_unknown_params!(params, %w[type position dimensions units], "create_component")
       scale = (params["units"].to_s.downcase == "in") ? 1.0 : (1.0 / 2.54)
       pos  = (params["position"]   || [0, 0, 0]).map { |v| v.to_f * scale }
       dims = (params["dimensions"] || [1, 1, 1]).map { |v| v.to_f * scale }
@@ -1139,6 +1143,42 @@ module SU_MCP
       end
     end
     
+    # Reject arguments the handler does not understand.
+    #
+    # A dropped argument is the same failure mode as a wrong unit conversion:
+    # the call succeeds and quietly does something other than what was asked.
+    # units was silently discarded for exactly this reason, so anyone passing
+    # units: "in" got centimetres and no way to tell.
+    def reject_unknown_params!(params, allowed, tool)
+      return unless params.is_a?(Hash)
+
+      unknown = params.keys.map { |k| k.to_s } - allowed
+      return if unknown.empty?
+
+      raise "#{tool}: unknown argument(s): #{unknown.join(', ')}. " \
+            "Accepted: #{allowed.join(', ')}."
+    end
+
+    # The three joinery tools are disabled.
+    #
+    # Live testing on 2.6.0 found all three destroy the board they are given:
+    # a clean 800 cm3 manifold board comes back at -1 cubic inch (SketchUp's
+    # "not a solid" sentinel) and manifold? == false. They do not cut -- they
+    # displace, shear, or add material outside the workpiece -- and because
+    # nothing wraps them in an abortable operation, the damage is committed.
+    #
+    # The push/pull rewrite that was meant to remove their SketchUp Pro
+    # dependency introduced this, and it shipped without live verification.
+    # Refusing is the only responsible state until they are rebuilt on
+    # cut_pocket, which already does correctly the thing all three get wrong.
+    def joinery_disabled!(name)
+      raise "#{name} is disabled: it corrupts the workpiece rather than " \
+            "cutting it, and commits the damage. Use cut_pocket to remove " \
+            "material, or cut the joint interactively in SketchUp. " \
+            "Tracking: the tool needs rebuilding on cut_pocket's " \
+            "face-normal and post-condition logic."
+    end
+
     # Extrude a base face upward.
     #
     # add_face derives its normal from winding order, so a base face can come
@@ -1185,9 +1225,11 @@ module SU_MCP
     # CSG (cutting with an arbitrary solid, angled or curved intersections)
     # still needs solid_op and therefore Pro.
     def cut_pocket(params)
+      committed = false
       model = Sketchup.active_model
       raise "No active model" unless model
 
+      reject_unknown_params!(params, %w[id points depth], "cut_pocket")
       target = resolve_solid(model, params["id"], "target")
       points = params["points"]
       unless points.is_a?(Array) && points.length >= 3
@@ -1200,6 +1242,11 @@ module SU_MCP
 
       entities = target.is_a?(Sketchup::Group) ? target.entities : target.definition.entities
       before = solid_stats(target)
+
+      # Wrap the whole cut so a failed one is a no-op. Detecting a bad result
+      # and then leaving it in the model -- telling the caller to run undo_last
+      # -- makes the caller clean up after us.
+      model.start_operation("MCP cut_pocket", true)
 
       # Caller works in centimetres; SketchUp geometry is inches.
       pts = points.map { |p| Geom::Point3d.new(p[0].to_f / 2.54, p[1].to_f / 2.54, p[2].to_f / 2.54) }
@@ -1224,6 +1271,9 @@ module SU_MCP
               "surface, or the push went outward. Use undo_last to revert."
       end
 
+      model.commit_operation
+      committed = true
+
       {
         success: true,
         result: {
@@ -1235,6 +1285,12 @@ module SU_MCP
           after: after
         }
       }
+    ensure
+      # Any raise above -- profile off the surface, cut removed nothing,
+      # non-manifold result -- rolls back instead of leaving debris behind.
+      if !committed && model && model.respond_to?(:abort_operation)
+        model.abort_operation rescue nil
+      end
     end
 
     # Solid (boolean) operations.
@@ -1670,6 +1726,8 @@ module SU_MCP
     end
     
     def create_mortise_tenon(params)
+      joinery_disabled!("create_mortise_tenon")
+
       log "Creating mortise and tenon joint with params: #{params.inspect}"
       model = Sketchup.active_model
       
@@ -1950,6 +2008,8 @@ module SU_MCP
     end
     
     def create_dovetail(params)
+      joinery_disabled!("create_dovetail")
+
       log "Creating dovetail joint with params: #{params.inspect}"
       model = Sketchup.active_model
       
@@ -2123,6 +2183,8 @@ module SU_MCP
     end
     
     def create_finger_joint(params)
+      joinery_disabled!("create_finger_joint")
+
       log "Creating finger joint with params: #{params.inspect}"
       model = Sketchup.active_model
       
@@ -2639,6 +2701,12 @@ module SU_MCP
         # defines constants on Object no matter which binding is passed.
         # Top-level constants (Sketchup, Geom, Math) still resolve normally.
         eval_scope = Module.new
+        # Without this, `def helper; end` defines an instance method on the
+        # module and calling helper(...) raises NoMethodError, because self is
+        # the module itself. extend self puts the module in its own singleton
+        # ancestry, so methods defined here are callable here. Constants stay
+        # isolated -- verified both properties.
+        eval_scope.extend(eval_scope)
         raw_result = nil
 
         # Capture anything the code prints. puts inside eval_ruby went to
