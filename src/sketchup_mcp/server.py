@@ -439,7 +439,8 @@ def transform_component(
     position: List[float] = None,
     translate: List[float] = None,
     rotation: List[float] = None,
-    scale: List[float] = None
+    scale: List[float] = None,
+    unglue: bool = False
 ) -> str:
     """Move, rotate or scale a component.
 
@@ -451,10 +452,19 @@ def transform_component(
         translate: RELATIVE offset [dx, dy, dz] in CENTIMETRES.
         rotation:  [rx, ry, rz] in degrees, about the entity's bounds centre.
         scale:     [sx, sy, sz] multipliers.
+        unglue:    allow a glue-to component to leave its glue plane.
 
     Pass position or translate, not both. Lengths are centimetres -- these
     were previously interpreted as inches, so asking to move 10 moved 25.4,
     and "position" silently behaved as a relative offset that accumulated.
+
+    Glue-to components -- windows and doors stuck to a wall -- are constrained
+    to the plane of the face they sit on. Moving one off that plane, or tilting
+    it out of parallel, is refused and rolled back, because SketchUp's validity
+    check silently snaps it back afterwards: the move reports success, measures
+    as applied, then disappears. Sliding one WITHIN its plane is fine. Pass
+    unglue to override, but note that permission does not make it stick --
+    SketchUp still enforces the constraint.
     """
     try:
         sketchup = get_sketchup_connection()
@@ -467,7 +477,9 @@ def transform_component(
             arguments["rotation"] = rotation
         if scale is not None:
             arguments["scale"] = scale
-            
+        if unglue:
+            arguments["unglue"] = True
+
         result = sketchup.send_command(
             method="tools/call",
             params={
@@ -672,7 +684,14 @@ def check_model(ctx: Context, limit: int = 50, max_faces: int = 4000) -> str:
 
     Fix by moving the stray geometry into the group -- cut it, double-click
     into the group, Edit > Paste In Place -- so SketchUp can merge it. Or
-    delete whichever face is redundant.
+    delete whichever face is redundant. Do NOT nudge one face off the plane:
+    that swaps a rendering artifact for two surfaces with a gap between them,
+    which measures and exports wrongly and is invisible on screen.
+
+    Glue-to components -- windows and doors stuck to a wall -- are MEANT to be
+    coplanar with their host face, so those pairs are excluded and counted
+    under by_design_ignored rather than reported. Acting on one would break a
+    working window, and SketchUp snaps it back anyway.
 
     **open shells** -- groups of several faces that do not close into a solid.
     They report no volume and cannot take part in solid operations or export
@@ -692,7 +711,8 @@ def check_model(ctx: Context, limit: int = 50, max_faces: int = 4000) -> str:
 
 
 @mcp.tool()
-def array_copy(ctx: Context, id: str, count: int, offset: List[float]) -> str:
+def array_copy(ctx: Context, id: str, count: int, offset: List[float],
+               unglue: bool = False) -> str:
     """Repeat an entity along a vector -- slats, pickets, balusters, shelves.
 
     This repeats a FINISHED entity, whatever it is: a board with a dovetail
@@ -704,6 +724,7 @@ def array_copy(ctx: Context, id: str, count: int, offset: List[float]) -> str:
         count:  total items in the finished array, INCLUDING the original --
                 count 12 adds 11 copies.
         offset: [dx, dy, dz] in CENTIMETRES, the step from one item to the next.
+        unglue: allow a glue-to component to leave its glue plane.
 
     Groups stay groups; component instances stay instances sharing their
     definition. For a grid, run it again on one of the resulting ids.
@@ -711,9 +732,14 @@ def array_copy(ctx: Context, id: str, count: int, offset: List[float]) -> str:
     Every copy's position is checked against where it should land before the
     operation is committed, so a wrong step -- or one applied in inches --
     fails rather than producing a plausible-looking array at the wrong pitch.
+
+    Repeating a glue-to component -- a row of windows along a wall -- works as
+    long as the step stays in the glue plane. A step that leaves it is refused
+    before anything is created, since SketchUp would snap every copy back.
     """
     return _call(ctx, "array_copy",
-                 {"id": id, "count": count, "offset": offset},
+                 {"id": id, "count": count, "offset": offset,
+                  "unglue": unglue},
                  timeout=LONG_TIMEOUT)
 
 

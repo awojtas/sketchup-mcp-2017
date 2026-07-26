@@ -65,6 +65,22 @@ tick error: execution expired
 
 Worse, a modal dialog wedges the socket loop until a human dismisses it, so the agent cannot recover on its own. Opening and closing documents is the user's job — ask, don't drive it.
 
+### SketchUp silently reverts some edits
+
+A coplanar face is not always a fault, and a successful move is not always a move.
+
+Glue-to components — windows and doors stuck to a wall — are *required* to lie exactly on the face they are glued to; a cutting one also punches the opening through it. Move one off that plane and SketchUp's validity check reverts it, reporting:
+
+```
+Glued CGroup (4223) not on or parallel to glue plane. - fixed
+```
+
+The edit applies, `measure` confirms it, a snapshot looks right, and then it disappears at the next validity check. There is no Ruby API for that checker (`Model#validate`, `#fix_problems` and friends do not exist in 2017), so nothing surfaces it in-process.
+
+`behavior.is2d?` identifies a glue-to container, and its own local Z is the glue-plane normal — verified against glued windows and a door whose local Z matched their host wall normal exactly. `transform_component` and `array_copy` refuse off-plane moves on that basis, and `check_model` excludes glue-to components from coplanar findings. Sliding one *within* its plane is legitimate.
+
+The general lesson: **never fix a coplanar overlap by nudging one face off the plane.** That trades a visible rendering artifact for two surfaces with an invisible gap, which still measures and exports wrongly. Merge the contexts, or delete the redundant face.
+
 ## Agent Guidelines
 
 ### Token efficiency
