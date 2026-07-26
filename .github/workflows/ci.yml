@@ -1,0 +1,65 @@
+name: CI
+
+# The Ruby 2.2 check and the socket suite used to run only on tag push, which
+# put them after the merge they were meant to guard. Three separate post-2.2
+# syntax errors have shipped and broken the extension in the field
+# (String#match?, String.new(encoding:), Hash#compact) -- each one merged
+# green, then failed on a user's machine. They run per pull request now.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  extension:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # SketchUp 2017 embeds Ruby 2.2.4, where anything newer is a hard
+      # runtime error rather than a warning.
+      - name: Check Ruby 2.2 compatibility
+        run: python3 scripts/check_ruby22_compat.py
+
+      # Guards the UI-freeze regression, and undefines the methods above so
+      # they fail at runtime on the paths the tests drive -- the static scan
+      # alone missed Hash#compact.
+      - name: Socket loop regression tests
+        run: ruby tests/test_socket_loop.rb
+
+      # Catches a malformed archive layout before a tag does. SketchUp needs
+      # the loader, main.rb and extension.json at the archive root; nesting
+      # them one level deeper installs silently and then does nothing.
+      - name: Build the .rbz
+        run: python3 scripts/build_rbz.py --version 0.0.0
+
+  client:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: pip install .
+
+      # Import rather than run: the client needs a live SketchUp to do
+      # anything, but a syntax error or a bad import is worth catching here.
+      - name: Import the server module
+        run: python3 -c "import sketchup_mcp.server"
+
+      - name: Byte-compile the scripts
+        run: python3 -m compileall -q scripts src
