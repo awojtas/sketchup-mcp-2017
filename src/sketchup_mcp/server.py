@@ -1,4 +1,5 @@
 from mcp.server.fastmcp import FastMCP, Context, Image
+import inspect
 import socket
 import json
 import os
@@ -313,7 +314,49 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
 
 
 # Create MCP server with lifespan support
-mcp = FastMCP(
+class StrictFastMCP(FastMCP):
+    """Reject unknown tool arguments rather than silently dropping them.
+
+    FastMCP validates arguments with pydantic, which ignores extra fields by
+    default. So `measure(id=1, sixe=5)` runs as `measure(id=1)`: a mistyped or
+    invented parameter vanishes and the call proceeds on defaults, which is
+    how a request silently does something other than what was asked.
+
+    The extension has reject_unknown_params! for exactly this, but it never
+    fires, because the argument never reaches the wire. Checking here, against
+    the tool's own signature, is the only place it can be caught.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self._allowed_args: Dict[str, set] = {}
+
+    def tool(self, *args: Any, **kwargs: Any):
+        register = super().tool(*args, **kwargs)
+
+        def decorator(fn):
+            name = kwargs.get("name") or fn.__name__
+            # ctx is injected by FastMCP, never sent by the caller.
+            self._allowed_args[name] = {
+                p for p in inspect.signature(fn).parameters if p != "ctx"
+            }
+            return register(fn)
+
+        return decorator
+
+    async def call_tool(self, name: str, arguments: Dict[str, Any]):
+        allowed = self._allowed_args.get(name)
+        if allowed is not None and isinstance(arguments, dict):
+            unknown = sorted(set(arguments) - allowed)
+            if unknown:
+                raise ValueError(
+                    f"{name}: unknown argument(s): {', '.join(unknown)}. "
+                    f"Accepted: {', '.join(sorted(allowed))}."
+                )
+        return await super().call_tool(name, arguments)
+
+
+mcp = StrictFastMCP(
     "SketchupMCP",
     instructions="SketchUp integration through the Model Context Protocol",
     lifespan=server_lifespan,
@@ -612,6 +655,32 @@ def create_dovetail(
     if across is not None:
         args["across"] = across
     return _call(ctx, "create_dovetail", args)
+
+@mcp.tool()
+def create_components(ctx: Context, items: List[Dict[str, Any]]) -> str:
+    """Create several primitives in one call and one undo step.
+
+    A model is rarely one box. Building a run of parts a call at a time leaves
+    a partial model behind when the fifth one is wrong, and a dozen entries in
+    the undo history to unpick.
+
+    Args:
+        items: list of specs, each taking the same fields as create_component:
+               {"type": "cube"|"cylinder"|"sphere"|"cone",
+                "position": [x, y, z], "dimensions": [x, y, z],
+                "units": "cm" (default) or "in"}
+
+    Every item is validated before anything is built, and the whole run is one
+    abortable operation -- so a bad spec anywhere means NOTHING is created,
+    rather than a half-built assembly to clean up by hand.
+
+    Returns each new id with its bounds and volume. Lengths are CENTIMETRES.
+
+    For parts derived by computation rather than listed out, eval_ruby is
+    still the tool -- it has a real loop.
+    """
+    return _call(ctx, "create_components", {"items": items}, timeout=LONG_TIMEOUT)
+
 
 @mcp.tool()
 def create_text(

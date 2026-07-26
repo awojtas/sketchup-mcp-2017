@@ -61,5 +61,11 @@ jobs:
       - name: Import the server module
         run: python3 -c "import sketchup_mcp.server"
 
+      # The unknown-argument guard is only useful if it keeps working, and it
+      # depends on FastMCP's call_tool staying the dispatch point. If a future
+      # version routes around it, the failure would be silent.
+      - name: Argument validation tests
+        run: python3 tests/test_client_args.py
+
       - name: Byte-compile the scripts
         run: python3 -m compileall -q scripts src

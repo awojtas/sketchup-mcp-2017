@@ -517,6 +517,8 @@ module SU_MCP
           create_finger_joint(args)
         when "create_text"
           create_text(args)
+        when "create_components"
+          create_components(args)
         when "eval_ruby"
           eval_ruby(args)
         when "batch"
@@ -631,6 +633,89 @@ module SU_MCP
         }
         log "Sending error response: #{response.inspect}"
         response
+      end
+    end
+
+    # Create several primitives in one call and one undo step.
+    #
+    # A model is rarely one box. Building a run of parts a call at a time
+    # leaves a partial model behind when the fifth one is wrong, and a dozen
+    # entries in the undo history to unpick by hand -- so callers reached for
+    # eval_ruby instead and lost the unit handling with it.
+    #
+    # Every item is validated BEFORE anything is built, and the whole run is
+    # one abortable operation, so a bad spec anywhere means nothing is created
+    # rather than a half-built assembly to clean up.
+    def create_components(params)
+      model = Sketchup.active_model
+      raise "No active model" unless model
+
+      reject_unknown_params!(params, %w[items], "create_components")
+      items = params["items"]
+      unless items.is_a?(Array) && !items.empty?
+        raise "items must be a non-empty array of component specs, each like " \
+              "the arguments to create_component"
+      end
+
+      items.each_with_index do |spec, i|
+        raise "items[#{i}] must be an object, got #{spec.class}" unless spec.is_a?(Hash)
+        reject_unknown_params!(spec, %w[type position dimensions units], "create_components items[#{i}]")
+
+        dims = spec["dimensions"] || [1, 1, 1]
+        unless dims.is_a?(Array) && dims.length == 3 && dims.all? { |v| v.to_f > 0 }
+          raise "items[#{i}]: dimensions must be three lengths greater than 0, " \
+                "got #{dims.inspect}"
+        end
+        pos = spec["position"] || [0, 0, 0]
+        unless pos.is_a?(Array) && pos.length == 3
+          raise "items[#{i}]: position must be [x, y, z], got #{pos.inspect}"
+        end
+      end
+
+      committed = false
+      created = []
+      begin
+        model.start_operation("MCP create_components", true)
+
+        items.each_with_index do |spec, i|
+          begin
+            result = create_component(spec)
+          rescue StandardError => e
+            raise "items[#{i}] (#{spec['type'] || 'cube'}) failed: #{e.message}. " \
+                  "Nothing was created."
+          end
+          id = result[:id]
+          raise "items[#{i}] produced no component. Nothing was created." unless id
+          created << id
+        end
+
+        stats = created.map do |id|
+          entity = model.find_entity_by_id(id)
+          raise "a component vanished after creation. Nothing was created." unless entity && entity.valid?
+          solid_stats(entity)
+        end
+
+        bad = stats.each_with_index.select { |s, _i| !s[:manifold] }
+        unless bad.empty?
+          raise "items #{bad.map { |_, i| i }.inspect} did not come out as solids, " \
+                "so the dimensions are probably degenerate. Nothing was created."
+        end
+
+        model.commit_operation
+        committed = true
+
+        {
+          success: true,
+          result: {
+            count: created.length,
+            ids: created,
+            components: stats
+          }
+        }
+      ensure
+        if !committed && model.respond_to?(:abort_operation)
+          model.abort_operation rescue nil
+        end
       end
     end
 
