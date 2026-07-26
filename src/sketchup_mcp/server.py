@@ -824,6 +824,35 @@ def transaction(ctx: Context, action: str, name: str = "MCP transaction",
 
 
 @mcp.tool()
+def cut_pocket(ctx: Context, id: int, points: List[List[float]], depth: float) -> str:
+    """Cut a pocket into a solid by drawing a profile on a face and pushing inward.
+
+    This is the way to remove material WITHOUT SketchUp Pro. Solid operations
+    (solid_op) are Pro-only, but most real cuts -- mortises, notches, rebates,
+    slots, holes -- are just a flat profile extruded into a face, which is
+    exactly what push/pull does, on every SketchUp edition.
+
+    Prefer this over solid_op whenever the cut is prismatic. It is simpler, it
+    does not consume and replace the solid, and it works for Make users.
+
+    Args:
+        id:     entityID of the solid to cut.
+        points: the profile, as [[x,y,z], ...] in CENTIMETRES. Must be coplanar
+                and lie on one face of the solid. Order around the outline.
+        depth:  how far to cut in, in centimetres. Always positive -- the
+                inward direction is worked out from the geometry.
+
+    Unlike solid_op the solid keeps its entityID. Returns how much material was
+    removed, and fails loudly if the cut removed nothing or left the solid
+    non-manifold, rather than leaving you with a plausible-looking wrong shape.
+
+    For cuts that genuinely need boolean geometry -- an arbitrary solid as the
+    cutter, angled or curved intersections -- use solid_op, which needs Pro.
+    """
+    return _call(ctx, "cut_pocket", {"id": id, "points": points, "depth": depth})
+
+
+@mcp.tool()
 def solid_op(ctx: Context, operation: str, target_id: int, tool_id: int,
              keep_tool: bool = False) -> str:
     """Boolean (solid) operation between two solids: subtract, union, intersect.
