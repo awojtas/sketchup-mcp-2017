@@ -175,3 +175,7 @@ Releases are tag-driven. Push `v<MAJOR>.<MINOR>.<PATCH>` and `.github/workflows/
 The tag is the **only** place a version is written. `build_rbz.py` stamps it into `extension.json` and the loader at build time. Don't reintroduce hardcoded version bumps — three copies had already drifted to 1.6.0 / 1.5.0 / 0.1.17 before this was centralised.
 
 The archive layout is load-bearing. SketchUp needs `su_mcp.rb`, `su_mcp/main.rb`, and `extension.json` at the **archive root**; nesting them one level deeper produces an extension that installs silently and then does nothing. `build_rbz.py` asserts this after writing.
+
+## Merge policy
+
+human — a person reviews and merges every PR.
